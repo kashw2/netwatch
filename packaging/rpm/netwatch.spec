@@ -10,7 +10,7 @@
 # below must match Cargo.toml. `spec_version_matches_the_crate` in
 # tests/packaging.rs fails the build if they drift.
 Name:           netwatch
-Version:        0.35.4
+Version:        0.37.0
 Release:        1%{?dist}
 Summary:        Real-time network diagnostics in your terminal
 
@@ -84,6 +84,9 @@ MSG
 %{_unitdir}/%{name}.service
 
 %changelog
+* Thu Oct 22 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 0.37.0-1
+- CI, fuzzing and supply chain: fuzz targets, cargo-deny, SBOM and attestations, auditable binaries, pcap golden tests
+
 * Sat Oct 17 2026 Matt Hartley <matthew.t.hartley@gmail.com> - 0.35.4-1
 - Windows interfaces on non-English installs; scrollable interface list
 

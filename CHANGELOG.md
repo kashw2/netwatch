@@ -2,7 +2,7 @@
 
 All notable changes to NetWatch will be documented in this file.
 
-## [Unreleased]
+## [0.37.0] - 2026-10-22
 
 ### Dependencies
 - nix 0.29 → 0.31, brotli 8 → 9, maxminddb 0.27 → 0.32, toml_edit 0.22 →
