@@ -5,13 +5,22 @@ use std::process::Command;
 
 mod iphlpapi;
 
+pub use iphlpapi::{default_gateway, dns_servers};
+
+/// Per-interface counters from `GetIfTable2`, keyed by the names
+/// [`collect_interface_info`] returns.
+///
+/// This runs every tick. It used to start PowerShell for
+/// Get-NetAdapterStatistics each time, 300-800 ms of process start-up per
+/// call, where the API answers in-process. PowerShell, and then `netstat -e`
+/// (one aggregate row), are kept only for when the API call fails.
 pub fn collect_interface_stats() -> Result<HashMap<String, InterfaceStats>> {
-    // Try PowerShell Get-NetAdapterStatistics for per-interface stats
+    if let Ok(stats) = iphlpapi::interface_stats() {
+        return Ok(stats);
+    }
     if let Ok(stats) = collect_stats_powershell() {
         return Ok(stats);
     }
-
-    // Fallback: parse netstat -e for aggregate stats
     collect_stats_netstat()
 }
 
@@ -250,7 +259,8 @@ fn extract_value(line: &str) -> Option<String> {
     }
 }
 
-/// Collect MTU values from `netsh interface ipv4 show subinterfaces`
+/// Collect MTU values from `netsh interface ipv4 show subinterfaces`, for the
+/// ipconfig fallback only: the API path takes the MTU from the adapter record.
 fn collect_mtu_map() -> HashMap<String, u32> {
     let mut map = HashMap::new();
 
@@ -302,11 +312,17 @@ fn collect_mtu_map() -> HashMap<String, u32> {
     map
 }
 
-/// Friendly adapter name -> interface GUID, from `Get-NetAdapter`. The GUID is
-/// what Npcap puts in its device name, so this is the one reliable bridge from
-/// the names ipconfig shows to the device pcap opens (issue #51). Empty when
-/// PowerShell is unavailable; the caller falls back to matching by address.
+/// Friendly adapter name -> interface GUID. The GUID is what Npcap puts in its
+/// device name, so this is the one reliable bridge from the names the
+/// interface list shows to the device pcap opens (issue #51).
+///
+/// `GetAdaptersAddresses` reports it as each adapter's `AdapterName`.
+/// `Get-NetAdapter` is the fallback when that call fails; empty when
+/// PowerShell is unavailable too, and the caller then matches by address.
 pub fn adapter_guids() -> HashMap<String, String> {
+    if let Ok(guids) = iphlpapi::adapter_guids() {
+        return guids;
+    }
     powershell(
         "Get-NetAdapter -IncludeHidden | Select-Object Name,InterfaceGuid | ConvertTo-Json -Compress",
     )
@@ -314,9 +330,20 @@ pub fn adapter_guids() -> HashMap<String, String> {
     .unwrap_or_default()
 }
 
-/// Friendly name of the adapter carrying the lowest-metric IPv4 default
-/// route. `InterfaceAlias` is the same name ipconfig and Get-NetAdapter use.
+/// Friendly name of the adapter carrying the best default route, from the
+/// routing table: IPv4 first, lowest route plus interface metric, as
+/// `ip_helper::default_routes` explains. Get-NetRoute is the fallback when
+/// the API call fails.
 pub fn default_route_interface() -> Option<String> {
+    match iphlpapi::default_route_interface() {
+        Ok(name) => name,
+        Err(_) => default_route_interface_powershell(),
+    }
+}
+
+/// The lowest-metric IPv4 default route's `InterfaceAlias`, which is the same
+/// name ipconfig and Get-NetAdapter use.
+fn default_route_interface_powershell() -> Option<String> {
     let alias = powershell(
         "(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue \
          | Sort-Object { $_.RouteMetric + $_.InterfaceMetric } \
