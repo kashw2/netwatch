@@ -1668,6 +1668,69 @@ mod tests {
         assert_eq!(rule.allow_ports, vec![443]);
     }
 
+    /// The policy file is reviewed by hand and often kept in version control,
+    /// so a toml release that changed how a saved one is laid out would show
+    /// as a diff of every rule. One process, so the map's order is fixed.
+    #[test]
+    fn saved_policy_layout_is_stable() {
+        let mut policy = EgressPolicy {
+            strict: true,
+            alert: AlertMode::All,
+            block: BlockList {
+                sni: vec!["*.example.net".into()],
+                ip: vec!["203.0.113.0/24".into(), "2001:db8::/32".into()],
+                ports: vec![23, 445],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        policy.process.insert(
+            "Google Chrome Helper.app".into(),
+            ProcessRule {
+                allow_sni: vec!["a.example.com".into(), "*.example.org".into()],
+                allow_asn: vec!["CLOUDFLARENET".into()],
+                allow_ports: vec![443, 80],
+                block: BlockList {
+                    ip: vec!["198.51.100.7".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            toml::to_string_pretty(&policy).unwrap(),
+            r#"strict = true
+alert = "all"
+
+[block]
+sni = ["*.example.net"]
+ip = [
+    "203.0.113.0/24",
+    "2001:db8::/32",
+]
+ports = [
+    23,
+    445,
+]
+
+[process."Google Chrome Helper.app"]
+allow_sni = [
+    "a.example.com",
+    "*.example.org",
+]
+allow_asn = ["CLOUDFLARENET"]
+allow_ip = []
+allow_ports = [
+    443,
+    80,
+]
+
+[process."Google Chrome Helper.app".block]
+ip = ["198.51.100.7"]
+"#
+        );
+    }
+
     #[test]
     fn observe_warns_on_drift_with_cooldown() {
         let mut p = EgressProfiler::new();

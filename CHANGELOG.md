@@ -34,6 +34,18 @@ All notable changes to NetWatch will be documented in this file.
   80×24 check the renderer makes, so in a terminal under about 40 columns
   every key overflowed.
 
+### Dependencies
+- **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**
+  toml 0.8 parsed through its own copy of toml_edit 0.22, next to the
+  toml_edit 0.25 the egress policy writer uses; toml 1.x needs neither.
+  config.toml and the egress policy are written byte for byte as before,
+  `--generate-config` included. config.toml can now also use TOML 1.1: an
+  inline table may span lines and end in a comma, and strings take `\e` and
+  `\xHH` escapes. Parse errors are worded a little differently.
+- **dirs 5 → 7.** Config, cache and state stay where they were on every
+  platform. The one location dirs 7 moved, `preference_dir` on Windows, is
+  not one netwatch uses.
+
 ## [0.37.0] - 2026-10-22
 
 ### Dependencies
