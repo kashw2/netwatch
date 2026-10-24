@@ -71,8 +71,10 @@ All notable changes to NetWatch will be documented in this file.
   unbound, such as a capture-only NIC or the physical NIC under a Hyper-V
   external switch. Packet counts now include broadcast and multicast, as
   they do on Linux and macOS, from the API and its fallbacks alike.
-  PowerShell, `route print` and `netstat -e` remain only as fallbacks for
-  when an API call fails.
+  PowerShell and `route print` remain only as fallbacks for when an API
+  call fails. `netstat -e`, the last fallback for counters, is no longer
+  run. It gave one machine-wide row that matched no interface, and only on
+  an English install.
 - **Incident bundles hold `packets.pcapng`, and `manifest.json` is version
   2.** `packets.pcap` is still written when every packet shares one link
   type and is dated before 2106. The manifest lists the packet files
@@ -170,7 +172,8 @@ All notable changes to NetWatch will be documented in this file.
   echoes itself through the Windows ICMP API (`IcmpSendEcho2`, IPv4 and
   IPv6), which needs no administrator rights and answers with a status code
   instead of text. A reply under a millisecond shows its measured fraction,
-  not 0. netwatch runs `ping.exe` only if it cannot open the ICMP API.
+  not 0. netwatch no longer starts `ping.exe` at all. It needs the same
+  ICMP API, so it could not help where netwatch's own call fails.
 - **Windows: traceroute works.** Since 0.32 the trace subprocess refused to
   start off Unix, so `T` ended in an error on Windows. Windows now traces
   natively through the ICMP API, IPv4 and IPv6, with three probes a hop up
@@ -260,6 +263,16 @@ All notable changes to NetWatch will be documented in this file.
   from Cargo.toml. The flake now lists x86_64-linux, aarch64-linux and
   aarch64-darwin only: nixpkgs dropped Intel Macs in 26.11, and listing
   them made the flake fail to evaluate.
+- **CI fails when Windows code compares English command output.** A test
+  reads the source as a Windows build compiles it and fails on any
+  comparison with English that ping, tracert, ipconfig, netstat, netsh or
+  another Windows tool prints, such as `Average =` or `LISTENING`, because
+  a translated install prints something else and the match finds nothing.
+  The only code allowed to read English is a fallback that runs after its
+  IP Helper call has failed: ipconfig for the interface list and for DNS
+  servers, and netstat's connection states. Each is listed in the test and
+  marked in the source. The netsh MTU fallback no longer looks for the
+  English header row; it reads only rows that start with a number.
 - **Windows CI runs the binary it builds.** On a runner with no Npcap,
   `netwatch --version` must print the Cargo.toml version, and
   `netwatch doctor --json` must report `npcap_missing` with the download
