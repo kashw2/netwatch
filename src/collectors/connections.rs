@@ -360,6 +360,12 @@ impl ConnectionCollector {
         *safe_write(&self.snapshot, "connections::publish") = Arc::new(rows);
     }
 
+    /// Record `coverage` as if a poll had measured it, for render tests.
+    #[cfg(all(target_os = "linux", test))]
+    pub(crate) fn set_coverage_for_test(&self, coverage: super::attribution::Coverage) {
+        *safe_write(&self.coverage, "connections::coverage") = coverage;
+    }
+
     pub fn with_capture_stats(mut self, stats: Arc<super::packets::CaptureStats>) -> Self {
         self.capture_stats = Some(stats);
         self
@@ -532,10 +538,7 @@ impl ConnectionCollector {
             measured.table_source = table_source;
             measured.table_note = table_note;
             #[cfg(target_os = "linux")]
-            log_table_source_change(
-                safe_read(&coverage, "connections::coverage").table_source,
-                &measured,
-            );
+            log_table_source_change(&safe_read(&coverage, "connections::coverage"), &measured);
             *safe_write(&coverage, "connections::coverage") = measured;
             let count = result.len();
             *safe_write(&snapshot, "connections::publish") = Arc::new(result);
@@ -1238,23 +1241,50 @@ fn parse_linux_connections_result(
 /// would otherwise repeat the same warning every two seconds.
 #[cfg(target_os = "linux")]
 fn log_table_source_change(
-    previous: Option<super::attribution::TableSource>,
+    previous: &super::attribution::Coverage,
     current: &super::attribution::Coverage,
 ) {
-    use super::attribution::TableSource;
-    if previous == current.table_source {
-        return;
-    }
+    let previous = previous.completed_at.map(|_| previous.table_source);
     let note = current.table_note.as_deref().unwrap_or_default();
-    match current.table_source {
-        Some(TableSource::ProcNet) => {
+    match table_change(previous, current.table_source) {
+        Some(TableChange::ProcNet) => {
             tracing::warn!(target: "netwatch::connections", note, "connection table read from /proc/net")
         }
-        Some(TableSource::Ss) if previous.is_some() => {
+        Some(TableChange::SsAgain) => {
             tracing::info!(target: "netwatch::connections", "connection table read from ss again")
         }
-        Some(TableSource::Ss) => {}
-        None => tracing::warn!(target: "netwatch::connections", note, "no connection table"),
+        Some(TableChange::NoTable) => {
+            tracing::warn!(target: "netwatch::connections", note, "no connection table")
+        }
+        None => {}
+    }
+}
+
+/// What [`log_table_source_change`] reports.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum TableChange {
+    ProcNet,
+    SsAgain,
+    NoTable,
+}
+
+/// `previous` is the last poll's source, and `None` before the first poll.
+/// Comparing sources alone could not tell a first poll that read no table
+/// from a repeat of one, so a session that never had a table logged nothing.
+#[cfg(target_os = "linux")]
+fn table_change(
+    previous: Option<Option<super::attribution::TableSource>>,
+    current: Option<super::attribution::TableSource>,
+) -> Option<TableChange> {
+    use super::attribution::TableSource;
+    if previous == Some(current) {
+        return None;
+    }
+    match current {
+        Some(TableSource::ProcNet) => Some(TableChange::ProcNet),
+        Some(TableSource::Ss) => previous.is_some().then_some(TableChange::SsAgain),
+        None => Some(TableChange::NoTable),
     }
 }
 
@@ -2767,6 +2797,34 @@ udp   UNCONN    0      0                       [::1]:323             [::]:*
             .any(|c| c.protocol == "TCP" && c.local_addr == local && c.state == "LISTEN"));
     }
 
+    /// The log notes each change of table once, including a session whose
+    /// very first poll reads no table, which compared equal to "not polled".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn table_changes_are_logged_once_from_the_first_poll() {
+        use super::super::attribution::TableSource::{ProcNet, Ss};
+        let cases = [
+            (None, Some(Ss), None),
+            (None, Some(ProcNet), Some(TableChange::ProcNet)),
+            (None, None, Some(TableChange::NoTable)),
+            (Some(None), None, None),
+            (Some(None), Some(Ss), Some(TableChange::SsAgain)),
+            (Some(None), Some(ProcNet), Some(TableChange::ProcNet)),
+            (Some(Some(Ss)), Some(Ss), None),
+            (Some(Some(Ss)), Some(ProcNet), Some(TableChange::ProcNet)),
+            (Some(Some(ProcNet)), Some(ProcNet), None),
+            (Some(Some(ProcNet)), Some(Ss), Some(TableChange::SsAgain)),
+            (Some(Some(ProcNet)), None, Some(TableChange::NoTable)),
+        ];
+        for (previous, current, want) in cases {
+            assert_eq!(
+                table_change(previous, current),
+                want,
+                "{previous:?} -> {current:?}"
+            );
+        }
+    }
+
     /// The fallback inside the confined worker. Landlock grants `/proc` but
     /// not execution outside the system paths, so an `ss` elsewhere (as on a
     /// host that installs it under another prefix) cannot start, and the poll
@@ -2975,11 +3033,18 @@ udp   UNCONN    0      0                       [::1]:323             [::]:*
         let port = listener.local_addr().unwrap().port();
         let _conn = TcpStream::connect((Ipv6Addr::LOCALHOST, port)).expect("connect to ::1");
 
-        let conns = parse_linux_connections();
-        if conns.is_empty() {
-            eprintln!("ss produced no rows (not installed?); skipping");
-            return;
-        }
+        // Only rows from ss: the /proc/net fallback would pass on any host
+        // and say nothing about the format ss prints.
+        let conns = match parse_linux_connections_result(SS_PROGRAM, None) {
+            Ok(table) if table.source == super::super::attribution::TableSource::Ss => table.rows,
+            other => {
+                eprintln!(
+                    "ss unavailable here ({:?}); skipping",
+                    other.map(|t| t.note)
+                );
+                return;
+            }
+        };
 
         // Our client row: TCP, established, remote port == the listener's.
         // Locating it *via parse_endpoint* is the point — if ss's v6

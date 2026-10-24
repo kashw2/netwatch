@@ -264,23 +264,22 @@ impl CapabilitySnapshot {
         }
     }
     pub fn compact(&self) -> String {
-        let mut line = format!(
+        format!(
             "capture: {} · attribution: {} · sandbox: {}",
             self.get("capture").state.label(),
             self.get("attribution").state.label(),
             self.get("sandbox").state.label()
-        );
-        // Named only when it is not `ss`, so Settings shows a /proc/net
-        // fallback and the usual line stays as it was.
-        if let Some(table) = self
-            .capabilities
+        )
+    }
+    /// A line for Settings when the connection table is not read from `ss`,
+    /// state first. It is a row of its own: appended to [`Self::compact`],
+    /// the popup cut it off in any terminal under about 140 columns.
+    pub fn connection_table_line(&self) -> Option<String> {
+        self.capabilities
             .iter()
             .find(|c| c.id == "connections")
             .filter(|c| matches!(c.state, State::Degraded | State::Unavailable))
-        {
-            line.push_str(&format!(" · connections: {}", table.state.label()));
-        }
-        line
+            .map(|c| format!("connections: {} · {}", c.state.label(), c.detail))
     }
     pub fn text(&self) -> String {
         let mut lines = vec![
@@ -1110,21 +1109,30 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     #[test]
-    fn compact_line_names_the_connection_table_only_when_it_is_not_ss() {
+    fn settings_names_the_connection_table_only_when_it_is_not_ss() {
         let mut snapshot = CapabilitySnapshot::configured(&NetwatchConfig::default());
         let usual = "capture: not checked · attribution: not checked · sandbox:";
-        assert!(snapshot.compact().starts_with(usual));
-        assert!(!snapshot.compact().contains("connections"));
+        assert_eq!(snapshot.connection_table_line(), None);
         snapshot.put("connections", State::Ready, "ss", "", None);
-        assert!(!snapshot.compact().contains("connections"));
+        assert_eq!(snapshot.connection_table_line(), None);
         snapshot.put(
             "connections",
             State::Degraded,
             "proc_net_fallback",
-            "",
+            "ss not found; read /proc/net",
             None,
         );
-        assert!(snapshot.compact().ends_with(" · connections: degraded"));
+        assert_eq!(
+            snapshot.connection_table_line().as_deref(),
+            Some("connections: degraded · ss not found; read /proc/net")
+        );
+        assert!(snapshot.compact().starts_with(usual));
+        assert!(!snapshot.compact().contains("connections"));
+        snapshot.put("connections", State::Unavailable, "", "empty", None);
+        assert_eq!(
+            snapshot.connection_table_line().as_deref(),
+            Some("connections: unavailable · empty")
+        );
     }
     /// A consumer of the stable doctor JSON sees one new capability id and
     /// nothing else changed: the snapshot still parses into the same shape.
