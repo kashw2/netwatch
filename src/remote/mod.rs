@@ -80,28 +80,44 @@ fn jitter_entropy() -> u64 {
         .unwrap_or(0)
 }
 
-/// Refuse a remote URL before anything is sent to it. Every POST carries the
-/// API key in its Authorization header, so over http:// anyone on the path
-/// can copy the key along with the snapshots. That needs
-/// `--insecure-remote`. A scheme that is neither is refused outright, rather
-/// than failing every POST later. The URL itself is left out of the errors,
-/// since it can carry credentials of its own.
-pub fn check_url(url: &str, allow_insecure: bool) -> anyhow::Result<()> {
+/// Refuse a remote URL before anything is sent to it, and return the form of
+/// it to send to. Every POST carries the API key in its Authorization
+/// header, so over http:// anyone on the path can copy the key along with
+/// the snapshots. That needs `--insecure-remote`. A scheme that is neither,
+/// or a URL ureq cannot send to, is refused outright, rather than failing
+/// every POST later. The URL itself is left out of the errors, since it can
+/// carry credentials of its own.
+pub fn check_url(url: &str, allow_insecure: bool) -> anyhow::Result<String> {
     // The scheme is case-insensitive here as it is to ureq, so `HTTP://` is
     // http too.
     let parsed = url::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid remote URL: {e}"))?;
     match parsed.scheme() {
-        "https" => Ok(()),
-        "http" if allow_insecure => Ok(()),
+        "https" => {}
+        "http" if allow_insecure => {}
         "http" => anyhow::bail!(
             "remote URL is http://, which sends the API key in cleartext; \
              use https://, or pass --insecure-remote to allow it"
         ),
         other => anyhow::bail!("remote URL must be https://, not {other}://"),
     }
+    // The url crate drops a tab or newline anywhere in the URL, such as the
+    // one a secret file ends with, and encodes a space or a non-ASCII host.
+    // ureq 2 parsed with it and sent what it made of the URL. ureq 3 parses
+    // with http::Uri, which refuses all of those, so it is given the url
+    // crate's form, and anything it still refuses is refused here.
+    let url = String::from(parsed);
+    ureq::http::Uri::try_from(ingest_endpoint(&url))
+        .map_err(|e| anyhow::anyhow!("invalid remote URL: {e}"))?;
+    Ok(url)
+}
+
+/// Where batches are POSTed under the remote URL.
+fn ingest_endpoint(url: &str) -> String {
+    format!("{}/api/v1/ingest", url.trim_end_matches('/'))
 }
 
 pub struct RemoteConfig {
+    /// As [`check_url`] returns it.
     pub url: String,
     pub api_key: String,
 }
@@ -144,7 +160,7 @@ impl RemotePublisher {
     }
 
     pub fn start(&self) {
-        let url = self.config.url.trim_end_matches('/').to_string();
+        let endpoint = ingest_endpoint(&self.config.url);
         let api_key = self.config.api_key.clone();
         let host_id = self.host_id;
         let data = self.snapshot_data.clone();
@@ -154,7 +170,6 @@ impl RemotePublisher {
 
         let handle = crate::sandbox::worker::spawn("remote", move || {
             let host_info = collect_host_info(host_id);
-            let endpoint = format!("{}/api/v1/ingest", url);
             let mut backoff = Backoff::new(Duration::from_millis(500), Duration::from_secs(60));
 
             // Enqueue immediately on first available snapshot, then on cadence.
@@ -824,6 +839,54 @@ mod tests {
         ] {
             assert!(check_url(url, true).is_err(), "{url}");
         }
+    }
+
+    /// Each worked under ureq 2, which parsed the URL as check_url does.
+    /// ureq 3's http::Uri refuses every one of them as given.
+    #[test]
+    fn the_remote_url_is_sent_as_the_url_crate_reads_it() {
+        for (given, sent) in [
+            (
+                "https://ingest.example.com\n",
+                "https://ingest.example.com/",
+            ),
+            (
+                "https://ingest.example.com\t/base/\r\n",
+                "https://ingest.example.com/base/",
+            ),
+            (
+                "https://ingest.example.com/a b",
+                "https://ingest.example.com/a%20b",
+            ),
+            ("https://bücher.example", "https://xn--bcher-kva.example/"),
+        ] {
+            assert!(ureq::http::Uri::try_from(ingest_endpoint(given)).is_err());
+            let url = check_url(given, false).unwrap();
+            assert_eq!(url, sent, "{given:?}");
+            assert!(ureq::http::Uri::try_from(ingest_endpoint(&url)).is_ok());
+        }
+    }
+
+    /// The trailing newline of a file-backed secret, end to end.
+    #[test]
+    fn a_remote_url_with_a_trailing_newline_still_delivers() {
+        let (endpoint, server) = ingest_once("202 Accepted");
+        let base = endpoint.strip_suffix("/api/v1/ingest").unwrap();
+        let url = check_url(&format!("{base}\n"), true).unwrap();
+        let queue = SnapshotQueue::new(QUEUE_CAP);
+        queue.push(json!({"n": 1}));
+        let got = try_flush_once(
+            &ingest_endpoint(&url),
+            "key",
+            &json!({}),
+            &AtomicBool::new(true),
+            &queue,
+            Some(Instant::now() + Duration::from_secs(5)),
+        );
+        assert_eq!(got, Some(SendOutcome::Ack));
+        assert!(queue.is_empty());
+        let (head, _) = server.join().unwrap();
+        assert!(head.starts_with("post /api/v1/ingest "), "{head}");
     }
 
     #[test]

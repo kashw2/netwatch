@@ -20,6 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -659,16 +660,25 @@ fn connect_times(dest: SocketAddr, n: usize, timeout: Duration) -> (Vec<f64>, us
         if cancelled() {
             break;
         }
-        let t = Instant::now();
-        match std::net::TcpStream::connect_timeout(&dest, timeout) {
-            Ok(_) => times.push(t.elapsed().as_secs_f64() * 1000.0),
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                times.push(t.elapsed().as_secs_f64() * 1000.0)
-            }
-            Err(_) => lost += 1,
+        match connect_time(dest, timeout) {
+            Some(ms) => times.push(ms),
+            None => lost += 1,
         }
     }
     (times, lost)
+}
+
+/// Milliseconds for one TCP connect to `dest`, or None if it never answered.
+/// A refusal is an answer.
+fn connect_time(dest: SocketAddr, timeout: Duration) -> Option<f64> {
+    let t = Instant::now();
+    match std::net::TcpStream::connect_timeout(&dest, timeout) {
+        Ok(_) => Some(t.elapsed().as_secs_f64() * 1000.0),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            Some(t.elapsed().as_secs_f64() * 1000.0)
+        }
+        Err(_) => None,
+    }
 }
 
 pub fn decide_tracks(
@@ -789,21 +799,34 @@ fn idle_vs_loaded(ctx: &Context) -> Result3 {
     let url = ctx.upload_url.clone();
     let bytes = ctx.upload_bytes;
     let cancel = cancellation();
-    let upload = std::thread::spawn(move || {
-        let started = Instant::now();
-        let (stop_sending, deadline) = (started + UPLOAD_SENDING, started + UPLOAD_BUDGET);
-        // Below 400, the server took the body. A redirect is not followed,
-        // and does not undo the load the bytes already put on the uplink.
-        upload_zeros(&url, bytes, stop_sending, deadline, &cancel).is_ok_and(|s| s < 400)
-    });
-    for _ in 0..20 {
-        if cancelled() {
-            break;
+    let started = Instant::now();
+    let (stop_sending, deadline) = (started + UPLOAD_SENDING, started + UPLOAD_BUDGET);
+    let sending = std::sync::Arc::new(AtomicBool::new(false));
+    let upload = std::thread::spawn({
+        let sending = sending.clone();
+        move || {
+            // Below 400, the server took the body. A redirect is not followed,
+            // and does not undo the load the bytes already put on the uplink.
+            upload_zeros(&url, bytes, stop_sending, deadline, &cancel, &sending)
+                .is_ok_and(|s| s < 400)
         }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let (loaded, _) = connect_times(dest, 5, Duration::from_secs(3));
+    });
+    let loaded = sample_under_load(
+        &sending,
+        || upload.is_finished(),
+        stop_sending,
+        LOAD_RAMP,
+        5,
+        || connect_time(dest, Duration::from_secs(3)),
+    );
     let uploaded = upload.join().unwrap_or(false);
+    let Some(loaded) = loaded else {
+        return (
+            Outcome::Inconclusive,
+            format!("idle {idle:.0}ms; the upload never started sending"),
+            BTreeMap::new(),
+        );
+    };
     let Some(loaded) = median(loaded) else {
         return (
             Outcome::Inconclusive,
@@ -837,6 +860,44 @@ fn idle_vs_loaded(ctx: &Context) -> Result3 {
 const UPLOAD_BUDGET: Duration = Duration::from_secs(14);
 /// How long after it starts the upload cuts its body short.
 const UPLOAD_SENDING: Duration = Duration::from_secs(10);
+/// How long the upload's body goes out before the loaded RTT is sampled.
+const LOAD_RAMP: Duration = Duration::from_secs(2);
+
+/// Up to `n` samples taken while the load upload's body is going out.
+///
+/// Name lookup, an unreachable address or two and the TLS handshake can use
+/// seconds of the upload's budget before the first byte of its body is sent,
+/// and RTT sampled before then is idle RTT. So this waits for `sending`,
+/// then `ramp` for the load to build, and starts no sample once the body is
+/// cut short at `stop_sending`. None if the body had not started by then, or
+/// the upload ended without starting it.
+fn sample_under_load(
+    sending: &AtomicBool,
+    upload_done: impl Fn() -> bool,
+    stop_sending: Instant,
+    ramp: Duration,
+    n: usize,
+    mut sample: impl FnMut() -> Option<f64>,
+) -> Option<Vec<f64>> {
+    while !sending.load(Ordering::Acquire) {
+        if cancelled() || upload_done() || Instant::now() >= stop_sending {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let ramp_end = Instant::now() + ramp;
+    while !cancelled() && Instant::now() < ramp_end {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut times = Vec::new();
+    for _ in 0..n {
+        if cancelled() || Instant::now() >= stop_sending {
+            break;
+        }
+        times.extend(sample());
+    }
+    Some(times)
+}
 
 /// Where the load upload goes, and the request head that starts it.
 #[derive(Debug)]
@@ -884,6 +945,7 @@ impl UploadRequest {
 }
 
 /// POST up to `bytes` zeros to `url` and return the status of the answer.
+/// `sending` is set once the request head is out and the body follows.
 ///
 /// A few lines of HTTP/1.1 rather than ureq, so that the name goes through
 /// the same cancellable lookup as every other probe and the connection is
@@ -898,6 +960,7 @@ fn upload_zeros(
     stop_sending: Instant,
     deadline: Instant,
     cancel: &super::probe_io::Cancel,
+    sending: &AtomicBool,
 ) -> std::io::Result<u16> {
     let req = UploadRequest::parse(url)?;
     let addrs = super::probe_io::resolve(&req.host, req.port, cancel)?;
@@ -909,9 +972,9 @@ fn upload_zeros(
         let conn = rustls::ClientConnection::new(super::targets::tls_config(), name)
             .map_err(std::io::Error::other)?;
         let mut tls = rustls::StreamOwned::new(conn, stream);
-        post_zeros(&mut tls, &req.head, bytes, stop_sending)
+        post_zeros(&mut tls, &req.head, bytes, stop_sending, sending)
     } else {
-        post_zeros(&mut stream, &req.head, bytes, stop_sending)
+        post_zeros(&mut stream, &req.head, bytes, stop_sending, sending)
     }
 }
 
@@ -964,16 +1027,19 @@ impl std::io::Write for UploadStream {
     }
 }
 
-/// Send `head`, then up to `bytes` zeros as a chunked body, cut short at
-/// `stop_sending`, and read back the final status.
+/// Send `head`, set `sending`, then send up to `bytes` zeros as a chunked
+/// body, cut short at `stop_sending`, and read back the final status.
 fn post_zeros(
     stream: &mut (impl std::io::Read + std::io::Write),
     head: &str,
     bytes: u64,
     stop_sending: Instant,
+    sending: &AtomicBool,
 ) -> std::io::Result<u16> {
     const CHUNK: usize = 64 * 1024;
+    // Over TLS this is where the handshake completes.
     stream.write_all(head.as_bytes())?;
+    sending.store(true, Ordering::Release);
     let full = chunk_frame(CHUNK);
     let mut left = bytes;
     while left > 0 && Instant::now() < stop_sending {
@@ -1612,8 +1678,10 @@ mod tests {
         let (addr, server) = upload_server("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".into());
         let url = format!("http://{addr}/__up?measId=1");
         let cancel = super::super::probe_io::Cancel::default();
-        let status = upload_zeros(&url, 200_000, far(), far(), &cancel).unwrap();
+        let sending = AtomicBool::new(false);
+        let status = upload_zeros(&url, 200_000, far(), far(), &cancel, &sending).unwrap();
         assert_eq!(status, 200);
+        assert!(sending.load(Ordering::Acquire));
         let (head, body) = server.join().unwrap();
         assert!(
             head.starts_with("POST /__up?measId=1 HTTP/1.1\r\n"),
@@ -1633,6 +1701,7 @@ mod tests {
             Instant::now(),
             far(),
             &cancel,
+            &AtomicBool::new(false),
         );
         assert_eq!(status.unwrap(), 200);
         assert_eq!(server.join().unwrap().1, 0);
@@ -1647,7 +1716,14 @@ mod tests {
             elsewhere.local_addr().unwrap()
         ));
         let cancel = super::super::probe_io::Cancel::default();
-        let status = upload_zeros(&format!("http://{addr}/"), 1000, far(), far(), &cancel);
+        let status = upload_zeros(
+            &format!("http://{addr}/"),
+            1000,
+            far(),
+            far(),
+            &cancel,
+            &AtomicBool::new(false),
+        );
         assert_eq!(status.unwrap(), 307);
         server.join().unwrap();
         assert!(elsewhere.accept().is_err(), "the redirect was followed");
@@ -1674,7 +1750,14 @@ mod tests {
             canceller.cancel();
         });
         let started = Instant::now();
-        let result = upload_zeros(&format!("http://{addr}/"), 1 << 30, far(), far(), &cancel);
+        let result = upload_zeros(
+            &format!("http://{addr}/"),
+            1 << 30,
+            far(),
+            far(),
+            &cancel,
+            &AtomicBool::new(false),
+        );
         assert!(result.is_err(), "{result:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
@@ -1699,6 +1782,7 @@ mod tests {
             far(),
             deadline,
             &cancel,
+            &AtomicBool::new(false),
         );
         assert!(result.is_err(), "{result:?}");
         assert!(started.elapsed() < Duration::from_secs(3));
@@ -1716,10 +1800,81 @@ mod tests {
             record
         });
         let cancel = super::super::probe_io::Cancel::default();
-        let result = upload_zeros(&format!("https://{addr}/"), 1000, far(), far(), &cancel);
+        let sending = AtomicBool::new(false);
+        let result = upload_zeros(
+            &format!("https://{addr}/"),
+            1000,
+            far(),
+            far(),
+            &cancel,
+            &sending,
+        );
         assert!(result.is_err(), "{result:?}");
+        assert!(
+            !sending.load(Ordering::Acquire),
+            "sending before the handshake"
+        );
         // A handshake record, TLS major version 3: not cleartext HTTP.
         assert_eq!(server.join().unwrap()[..2], [0x16, 0x03]);
+    }
+
+    /// The body starts late, as when the first resolved addresses do not
+    /// answer. No sample is taken before it has had its ramp, or after it is
+    /// cut short.
+    #[test]
+    fn loaded_samples_are_taken_only_while_the_body_goes_out() {
+        let started = Instant::now();
+        let stop_sending = started + Duration::from_millis(900);
+        let sending = AtomicBool::new(false);
+        let mut taken = Vec::new();
+        let samples = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                sending.store(true, Ordering::Release);
+            });
+            sample_under_load(
+                &sending,
+                || false,
+                stop_sending,
+                Duration::from_millis(200),
+                100,
+                || {
+                    taken.push(Instant::now());
+                    std::thread::sleep(Duration::from_millis(50));
+                    Some(1.0)
+                },
+            )
+        });
+        assert_eq!(samples.map(|t| t.len()), Some(taken.len()));
+        assert!(!taken.is_empty());
+        for at in &taken {
+            assert!(
+                *at >= started + Duration::from_millis(500),
+                "before the ramp"
+            );
+            assert!(*at < stop_sending, "after the body was cut short");
+        }
+
+        // The body starts too late for its ramp to end in time.
+        let soon = Instant::now() + Duration::from_millis(100);
+        let ramp = Duration::from_millis(200);
+        let samples = sample_under_load(
+            &AtomicBool::new(true),
+            || false,
+            soon,
+            ramp,
+            5,
+            || panic!("sampled after the body was cut short"),
+        );
+        assert_eq!(samples, Some(Vec::new()));
+
+        // The body never starts: the upload fails first, or runs out of time.
+        let idle = AtomicBool::new(false);
+        let failed = sample_under_load(&idle, || true, far(), ramp, 5, || panic!("no upload"));
+        assert_eq!(failed, None);
+        let soon = Instant::now() + Duration::from_millis(100);
+        let late = sample_under_load(&idle, || false, soon, ramp, 5, || panic!("no upload"));
+        assert_eq!(late, None);
     }
 
     #[test]

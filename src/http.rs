@@ -9,7 +9,8 @@
 //!
 //! Where ureq 3's defaults differ from what ureq 2 did here, [`build`] sets
 //! the old behaviour by hand: no proxy from the environment, the same
-//! redirect limit, and 4xx and 5xx statuses as errors.
+//! redirect limit, and 4xx and 5xx statuses as errors. [`read_text`] keeps
+//! ureq 2's cap on decompressed text.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -23,6 +24,16 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long any single read or write may wait on the peer.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a response body may take to arrive once its head has, the body
+/// of a redirect included. ureq 3 reads a redirect's body to the end before
+/// following it, where ureq 2 dropped it unread, so without this a 3xx that
+/// streams forever holds the caller forever, at line rate.
+pub const BODY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The most text [`read_text`] takes from one body, counted after gzip is
+/// undone, as ureq 2 counted it.
+pub const MAX_TEXT: u64 = 10 * 1024 * 1024;
+
 /// Redirects followed before the request fails with `TooManyRedirects`.
 /// ureq 2's limit of 5 counted the response that broke it, so it followed
 /// four; ureq 3 counts only the redirects it follows.
@@ -31,21 +42,45 @@ const MAX_REDIRECTS: u32 = 4;
 /// The shared agent. Built once, so its connection pool is shared too.
 pub fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| build(CONNECT_TIMEOUT, IO_TIMEOUT))
+    AGENT.get_or_init(|| build(CONNECT_TIMEOUT, IO_TIMEOUT, BODY_TIMEOUT))
 }
 
 /// GET `url` through the shared agent and read the body as text, up to
-/// ureq's 10 MiB limit. A 4xx or 5xx answer is an error, the same as a
-/// connection that fails.
+/// [`MAX_TEXT`]. A 4xx or 5xx answer is an error, the same as a connection
+/// that fails.
 pub fn get_text(url: &str) -> Result<String, ureq::Error> {
-    agent().get(url).call()?.into_body().read_to_string()
+    read_text(agent().get(url).call()?.into_body())
 }
 
-fn build(connect: Duration, io: Duration) -> ureq::Agent {
+/// Read a response body as text, up to [`MAX_TEXT`] bytes of it.
+///
+/// Not ureq 3's `read_to_string`: its 10 MiB limit counts the bytes on the
+/// wire, before gzip is undone, and ureq decodes gzip whenever the response
+/// says it is. 10 MiB of compressed zeros would come out as some 10 GiB of
+/// `String`. Both are capped here: the wire bytes, so a stream of empty gzip
+/// members cannot run on, and the text, so it cannot outgrow the limit.
+pub fn read_text(body: ureq::Body) -> Result<String, ureq::Error> {
+    use std::io::Read;
+    let mut text = Vec::new();
+    body.into_with_config()
+        .limit(MAX_TEXT)
+        .lossy_utf8(true)
+        .reader()
+        .take(MAX_TEXT + 1)
+        .read_to_end(&mut text)?;
+    if text.len() as u64 > MAX_TEXT {
+        return Err(ureq::Error::BodyExceedsLimit(MAX_TEXT));
+    }
+    String::from_utf8(text)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e).into())
+}
+
+fn build(connect: Duration, io: Duration, body: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(connect))
         .timeout_per_read(Some(io))
         .timeout_per_write(Some(io))
+        .timeout_recv_body(Some(body))
         // ureq 3 reads HTTP_PROXY, HTTPS_PROXY and ALL_PROXY by default;
         // ureq 2, built without its proxy-from-env feature, did not. Every
         // request here goes direct, as it always has.
@@ -108,7 +143,7 @@ mod tests {
         });
 
         let started = Instant::now();
-        let result = build(CONNECT_TIMEOUT, Duration::from_millis(200))
+        let result = build(CONNECT_TIMEOUT, Duration::from_millis(200), BODY_TIMEOUT)
             .get(&url)
             .call();
         assert!(
@@ -158,6 +193,68 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(server.join().unwrap(), 5);
+    }
+
+    /// A gzip body that inflates past the limit. ureq 3's own
+    /// `read_to_string` counts only the compressed bytes and would hand back
+    /// all of it.
+    #[test]
+    fn a_body_is_capped_after_it_is_decompressed() {
+        use flate2::{write::GzEncoder, Compression};
+        let mut gz = GzEncoder::new(Vec::new(), Compression::best());
+        gz.write_all(&vec![b' '; MAX_TEXT as usize + 1024]).unwrap();
+        let gz = gz.finish().unwrap();
+        assert!(gz.len() < 1 << 20, "{} bytes compressed", gz.len());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_head(&mut stream);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                gz.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&gz);
+        });
+        let result = get_text(&url);
+        assert!(
+            matches!(result, Err(ureq::Error::BodyExceedsLimit(MAX_TEXT))),
+            "{:?}",
+            result.map(|s| s.len())
+        );
+        server.join().unwrap();
+    }
+
+    /// A redirect whose body never ends. ureq 3 reads it all before
+    /// following the redirect; the body timeout stops it.
+    #[test]
+    fn an_endless_redirect_body_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_head(&mut stream);
+            let head = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{addr}/next\r\n\
+                 Transfer-Encoding: chunked\r\n\r\n"
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let chunk = [b"4000\r\n".as_slice(), &[b'x'; 0x4000], b"\r\n"].concat();
+            while stream.write_all(&chunk).is_ok() {}
+        });
+
+        let started = Instant::now();
+        let result = build(CONNECT_TIMEOUT, IO_TIMEOUT, Duration::from_millis(300))
+            .get(&format!("http://{addr}/"))
+            .call();
+        assert!(
+            matches!(result, Err(ureq::Error::Timeout(ureq::Timeout::RecvBody))),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(agent().config().timeouts().recv_body, Some(BODY_TIMEOUT));
     }
 
     /// ureq 3 would pick up a proxy from the environment by default. Checked

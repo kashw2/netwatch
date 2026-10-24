@@ -510,16 +510,15 @@ fn call_ollama(
     // redirect settings. Its 10 s limit per read is lifted and the whole call
     // bounded instead, because with `stream: false` the model sends nothing
     // until it has finished, and a slow model takes longer than 10 s.
-    let body_str = crate::http::agent()
+    let response = crate::http::agent()
         .post(&url)
         .config()
         .timeout_global(Some(OLLAMA_TIMEOUT))
         .timeout_per_read(None)
         .build()
         .header("Content-Type", "application/json")
-        .send(body.to_string())?
-        .into_body()
-        .read_to_string()?;
+        .send(body.to_string())?;
+    let body_str = crate::http::read_text(response.into_body())?;
     let json: serde_json::Value = serde_json::from_str(&body_str)?;
     let content = json["message"]["content"]
         .as_str()
