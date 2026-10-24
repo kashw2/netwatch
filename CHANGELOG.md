@@ -252,6 +252,12 @@ All notable changes to NetWatch will be documented in this file.
   unmaintained crate ratatui 0.27 built with, is gone from the tree.
 
 ### CI
+- **The Nix flake is built in CI.** A new workflow runs `nix build`, test
+  suite included, on every change and once a week, evaluates the flake for
+  every system it declares, and checks that the built binary reports the
+  Cargo.toml version. The flake had stopped building without anyone
+  noticing until #105, from @kashw2, fixed it and made it read its version
+  from Cargo.toml.
 - **Windows CI runs the binary it builds.** On a runner with no Npcap,
   `netwatch --version` must print the Cargo.toml version, and
   `netwatch doctor --json` must report `npcap_missing` with the download
