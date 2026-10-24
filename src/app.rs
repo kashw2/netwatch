@@ -1536,7 +1536,10 @@ pub(crate) fn parse_addr_parts(addr: &str) -> (Option<String>, Option<String>) {
         return (None, None);
     }
     if let Some(bracket_end) = addr.rfind("]:") {
-        (part(&addr[1..bracket_end]), part(&addr[bracket_end + 2..]))
+        // macOS lsof prints a link-local endpoint with no opening bracket
+        // (`fe80:16::1]:1024`), so the first character is not always one.
+        let host = addr[..bracket_end].trim_start_matches('[');
+        (part(host), part(&addr[bracket_end + 2..]))
     } else if let Some(colon) = addr.rfind(':') {
         (part(&addr[..colon]), part(&addr[colon + 1..]))
     } else {
@@ -4491,6 +4494,40 @@ mod tests {
         sort_connections(&mut conns, col(Tab::Connections, "Remote Address"));
         let addrs: Vec<_> = conns.iter().map(|c| c.remote_addr.as_str()).collect();
         assert_eq!(addrs, vec!["1.2.3.4:80", "10.0.0.1:80", "192.168.1.1:443"]);
+    }
+
+    /// Enter on a connection filters the Packets tab to its peer. The filter
+    /// has to name the peer as capture does, whichever way the platform
+    /// printed the row: v4-mapped, zoned, or macOS `lsof`'s link-local form
+    /// with no opening bracket, which used to lose its first character.
+    #[test]
+    fn a_connection_filter_names_the_peer_as_capture_does() {
+        use crate::collectors::packets::{parse_filter, FilterExpr};
+        for (remote, peer, port) in [
+            ("[2001:db8::20]:22", "2001:db8::20", 22),
+            ("[::ffff:192.0.2.10]:443", "192.0.2.10", 443),
+            ("[fe80::1%eth0]:22", "fe80::1", 22),
+            (
+                "fe80:16::aede:48ff:fe00:1122]:1024",
+                "fe80::aede:48ff:fe00:1122",
+                1024,
+            ),
+            ("192.0.2.10:443", "192.0.2.10", 443),
+        ] {
+            let c = conn_full(None, None, "0:0", remote, None, None);
+            let filter = parse_filter(&build_connection_filter(&c)).unwrap();
+            let FilterExpr::And(ip, p) = filter else {
+                panic!("{remote}: {filter:?}");
+            };
+            assert!(
+                matches!(*ip, FilterExpr::Ip(ref ip) if ip == peer),
+                "{remote}: {ip:?}"
+            );
+            assert!(
+                matches!(*p, FilterExpr::Port(n) if n == port),
+                "{remote}: {p:?}"
+            );
+        }
     }
 
     #[test]

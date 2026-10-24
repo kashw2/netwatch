@@ -191,6 +191,21 @@ All notable changes to NetWatch will be documented in this file.
   length on the wire. Times now come from libpcap, in UTC to the
   microsecond. `--demo` packets, which were never captured, are left out
   and counted instead of written with an invented time.
+- **IPv6 connections show their protocol, rates and packets.** Packet
+  capture wrote IPv6 addresses with every group spelled out
+  (`2001:db8:0:0:0:0:0:1`) while the connection table compresses them
+  (`2001:db8::1`), so no IPv6 connection ever found its capture stream. The
+  Connections and Dense views showed no protocol, SNI or JA4 for it, and no
+  live rate, retransmits or handshake time; its packets got no owner in a
+  PCAPNG export; and `Enter` on the row opened an empty Packets list, as it
+  also did for a dual-stack socket's `::ffff:192.0.2.1` peer. Capture now
+  writes IPv6 in the standard compressed form (RFC 5952) in the packet list
+  and details. Rows also join when `ss` adds a `%dev` zone and when macOS
+  `lsof` writes the interface into a link-local address. Display filters
+  take an address in any of those spellings, and `ip.addr == X` as Wireshark
+  writes it; a whole address now matches only itself, so `10.0.0.1` no
+  longer also shows `10.0.0.10`. IPv6 loopback traffic no longer reaches the
+  beaconing detector as if it were external.
 
 ### Dependencies
 - **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**
