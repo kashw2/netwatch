@@ -37,9 +37,10 @@ pub const ANNOTATION_SCHEMA: &str = "netwatch.annotation.v1";
 const MAX_TEXT_CHARS: usize = 160;
 
 /// Longest bracket between two socket observations that may annotate the
-/// packets inside it. The connection table is polled about once a second, so
-/// anything wider means polls were missed and the socket could have changed
-/// hands in between.
+/// packets inside it, from the start of the first owner check to the end of
+/// the second. Owners are checked about once a second, so anything wider
+/// means checks were missed and the socket could have changed hands in
+/// between.
 const MAX_BRACKET_MS: u64 = 5000;
 
 /// Timestamps are written in microseconds, which is what live libpcap capture
@@ -167,7 +168,9 @@ pub struct PacketAnnotation {
     pub process: ProcessIdentity,
     pub process_name: Option<String>,
     pub source: AttributionSource,
+    /// UTC ms by which the earlier check of the owner had finished.
     pub before_utc_ms: u64,
+    /// UTC ms at which the later check of the owner began.
     pub after_utc_ms: u64,
     pub flow_generation: u64,
     pub capture_generation: u32,
@@ -181,7 +184,11 @@ struct Observation {
     process: ProcessIdentity,
     process_name: Option<String>,
     source: AttributionSource,
-    observed_at_utc_ms: u64,
+    /// The owner was seen holding the socket at some point from
+    /// `checked_from` to `checked_until`, UTC ms. Not the poll's time: see
+    /// `MatchEvidence::owner_checked_utc_ms`.
+    checked_from: u64,
+    checked_until: u64,
     flow_session: String,
     flow_generation: u64,
     capture_generation: Option<u32>,
@@ -191,17 +198,22 @@ struct Observation {
 
 impl Observation {
     /// `None` for a row whose owner is not verified now: unknown, stale, or
-    /// without a process identity or flow.
+    /// without a process identity, flow or time of check.
     fn from_connection(c: &Connection, local: (String, u16)) -> Option<Self> {
         if !c.evidence.verified() {
             return None;
         }
         let flow = c.evidence.flow.as_ref()?;
+        let (checked_from, checked_until) = c
+            .evidence
+            .owner_checked_utc_ms
+            .filter(|(from, until)| from <= until)?;
         Some(Self {
             process: c.evidence.process.clone()?,
             process_name: c.process_name.clone(),
             source: c.attribution,
-            observed_at_utc_ms: c.evidence.observed_at_utc_ms?,
+            checked_from,
+            checked_until,
             flow_session: flow.session.clone(),
             flow_generation: flow.generation,
             capture_generation: flow.capture_generation,
@@ -211,7 +223,9 @@ impl Observation {
     }
 
     /// Whether `self`, the earlier poll, and `later` describe one socket
-    /// owned by one process, for a packet of capture stream `generation`.
+    /// owned by one process, for a packet of capture stream `generation`,
+    /// from two separate checks of the owner: polls that carry one broker
+    /// scan have overlapping check times and never qualify.
     fn same_socket(&self, later: &Self, generation: u32) -> bool {
         self.process == later.process
             && self.flow_session == later.flow_session
@@ -220,16 +234,20 @@ impl Observation {
             && later.capture_generation == Some(generation)
             && self.local == later.local
             && self.remote == later.remote
-            && self.observed_at_utc_ms < later.observed_at_utc_ms
-            && later.observed_at_utc_ms - self.observed_at_utc_ms <= MAX_BRACKET_MS
+            && self.checked_until < later.checked_from
+            && later.checked_until - self.checked_from <= MAX_BRACKET_MS
     }
 }
 
 /// Annotates packets with the socket owner only when two consecutive polls of
-/// the connection table agree on it and the packet was captured between them.
-/// One poll is not enough: the socket may have changed hands just before or
-/// after it. `None` entries mark flows with no single verified owner, such
-/// as loopback, where both ends are local and may be different processes.
+/// the connection table agree on it and the packet was captured between the
+/// checks of the owner they carry: the earlier check finished before the
+/// packet and the later one began after it. One check is not enough: the
+/// socket may have changed hands just before or after it. A check is not the
+/// poll itself, since on Linux a sandboxed poll takes owners from the
+/// broker's latest `/proc` scan, which can predate the poll and be shared by
+/// several. `None` entries mark flows with no single verified owner, such as
+/// loopback, where both ends are local and may be different processes.
 #[derive(Default)]
 pub struct AnnotationHistory {
     previous: HashMap<StreamKey, Option<Observation>>,
@@ -270,13 +288,13 @@ impl AnnotationHistory {
                 .and_modify(|seen| *seen = None)
                 .or_insert(observation);
         }
-        // Only a packet newer than the oldest earlier poll can sit inside a
+        // Only a packet newer than the oldest earlier check can sit inside a
         // bracket, so the rest of the ring is skipped without building keys.
         let floor = self
             .previous
             .values()
             .flatten()
-            .map(|o| o.observed_at_utc_ms)
+            .map(|o| o.checked_until)
             .min();
         if let (Some(floor), Some(session)) = (floor, self.session.as_deref()) {
             for packet in packets.iter_mut() {
@@ -322,8 +340,8 @@ fn annotate(
         return;
     };
     if !before.same_socket(after, generation)
-        || ms <= before.observed_at_utc_ms
-        || ms >= after.observed_at_utc_ms
+        || ms <= before.checked_until
+        || ms >= after.checked_from
     {
         return;
     }
@@ -332,8 +350,8 @@ fn annotate(
         process: after.process.clone(),
         process_name: after.process_name.clone(),
         source: after.source,
-        before_utc_ms: before.observed_at_utc_ms,
-        after_utc_ms: after.observed_at_utc_ms,
+        before_utc_ms: before.checked_until,
+        after_utc_ms: after.checked_from,
         flow_generation: after.flow_generation,
         capture_generation: generation,
         direction: if outbound {
@@ -348,10 +366,42 @@ fn annotate(
 /// terminal and bounded: characters that could reorder or hide text become
 /// the same mark the packet list uses, so tampering stays visible.
 fn clean(value: &str) -> String {
-    crate::ui::sanitize::display(value)
+    use crate::ui::sanitize::{display, REPLACEMENT};
+    display(value)
         .chars()
+        .map(|c| if invisible(c) { REPLACEMENT } else { c })
         .take(MAX_TEXT_CHARS)
         .collect()
+}
+
+/// Every format character (General_Category Cf, as of Unicode 16) and the
+/// line and paragraph separators. The terminal sanitizer passes most of
+/// them, since a terminal draws them harmlessly, but a comment reader shows
+/// a tag character or a soft hyphen as nothing and U+2028 as a line break,
+/// so an SNI could read as another name.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,6 +444,17 @@ pub fn preview_iter<'a>(packets: impl IntoIterator<Item = &'a CapturedPacket>) -
         }
     }
     summary
+}
+
+/// Whether classic PCAP can hold every exportable packet: one link type, and
+/// times before 2106, when its 32-bit seconds run out. True for an empty
+/// selection.
+pub fn fits_pcap<P: Borrow<CapturedPacket>>(packets: &[P]) -> bool {
+    single_link_type(packets)
+        && packets
+            .iter()
+            .filter_map(|p| exportable(p.borrow()))
+            .all(|m| m.timestamp_ns / 1_000_000_000 <= u64::from(u32::MAX))
 }
 
 /// Whether every exportable packet shares one link type, which classic PCAP
@@ -694,6 +755,11 @@ fn write_pcapng<P: Borrow<CapturedPacket>>(
         };
         w.write_all(&enhanced_packet(id, m, &p.raw_bytes, comment.as_deref())?)?;
     }
+    // libpcap refuses a section with no interface, so a file without packets
+    // still describes one: Ethernet, as classic PCAP's header does then.
+    if interfaces.is_empty() {
+        w.write_all(&interface_description(1, "")?)?;
+    }
     Ok(())
 }
 
@@ -877,6 +943,7 @@ mod tests {
             evidence: MatchEvidence {
                 observed_at: Some(Instant::now()),
                 observed_at_utc_ms: Some(ms),
+                owner_checked_utc_ms: Some((ms, ms)),
                 process: Some(ProcessIdentity {
                     session: "run".into(),
                     pid: 42,
@@ -1407,7 +1474,7 @@ mod tests {
         );
         history.observe(&[], &mut packets); // exit cannot rewrite frozen evidence
         assert!(packets[0].annotation.is_some());
-        for case in 0..11 {
+        for case in 0..14 {
             let mut changed = b.clone();
             let mut before = a.clone();
             let mut h = AnnotationHistory::default();
@@ -1421,17 +1488,26 @@ mod tests {
                         Some(Instant::now() - std::time::Duration::from_secs(6))
                 }
                 4 => changed.evidence.process = None,
-                5 => changed.evidence.observed_at_utc_ms = Some(1000),
-                6 => before.evidence.observed_at_utc_ms = Some(1600),
+                5 => changed.evidence.owner_checked_utc_ms = Some((1000, 1000)),
+                6 => before.evidence.owner_checked_utc_ms = Some((1600, 1600)),
                 7 => {
                     changed.evidence.process.as_mut().unwrap().network_namespace =
                         Some("different".into())
                 }
-                8 => changed.evidence.observed_at_utc_ms = Some(1000 + MAX_BRACKET_MS + 1),
+                8 => {
+                    changed.evidence.owner_checked_utc_ms =
+                        Some((1000 + MAX_BRACKET_MS + 1, 1000 + MAX_BRACKET_MS + 1))
+                }
                 9 => {
                     changed.evidence.unknown_reason =
                         Some(crate::collectors::attribution::UnknownReason::IdentityUnavailable)
                 }
+                // The later check of the owner began before the packet, or
+                // the earlier one ended after it, whenever the polls ran.
+                10 => changed.evidence.owner_checked_utc_ms = Some((1400, 1600)),
+                11 => before.evidence.owner_checked_utc_ms = Some((900, 1500)),
+                // No time of check at all.
+                12 => changed.evidence.owner_checked_utc_ms = None,
                 _ => changed.evidence.flow.as_mut().unwrap().session = "other-run".into(),
             }
             h.observe(&[before], &mut ps);
@@ -1460,6 +1536,34 @@ mod tests {
         h.observe(&[a.clone(), a], &mut ps);
         h.observe(&[b.clone(), b], &mut ps);
         assert!(ps[0].annotation.is_none());
+    }
+
+    /// On Linux a sandboxed poll takes owners from the broker's latest
+    /// `/proc` scan, so when the poll ran says nothing about when the owner
+    /// was seen, and consecutive polls can carry the same scan.
+    #[test]
+    fn the_bracket_is_when_the_owner_was_checked_not_when_polled() {
+        let mut p = packet();
+        p.capture.as_mut().unwrap().timestamp_ns = 1_500_000_000;
+        let scanned = |from, until, poll| {
+            let mut c = conn(poll);
+            c.evidence.owner_checked_utc_ms = Some((from, until));
+            c
+        };
+        let mut h = AnnotationHistory::default();
+        let mut ps = vec![p];
+        // Polls either side of the packet, both carrying one scan from
+        // before it: the owner was seen once, before the packet.
+        h.observe(&[scanned(900, 950, 1000)], &mut ps);
+        h.observe(&[scanned(900, 950, 2000)], &mut ps);
+        assert!(ps[0].annotation.is_none());
+        // The next poll carries a scan begun after the packet.
+        h.observe(&[scanned(1600, 1700, 2200)], &mut ps);
+        let annotation = ps[0].annotation.as_ref().unwrap();
+        assert_eq!(
+            (annotation.before_utc_ms, annotation.after_utc_ms),
+            (950, 1600)
+        );
     }
 
     #[test]
@@ -1501,9 +1605,29 @@ mod tests {
     /// Process names, SNIs and interface names are chosen by other programs
     /// and peers. Whatever they hold, the comment stays valid JSON within the
     /// length bound, with nothing that can reorder text or drive a terminal.
+    fn unsafe_or_invisible(c: char) -> bool {
+        crate::ui::sanitize::is_unsafe(c) || invisible(c)
+    }
+
+    /// Characters a terminal draws harmlessly but a comment reader hides, or
+    /// breaks the line at, are marked like the rest.
+    #[test]
+    fn invisible_text_is_marked() {
+        assert_eq!(
+            clean("login.bank.example\u{E0065}\u{E0076}"),
+            "login.bank.example··"
+        );
+        assert_eq!(
+            clean("a\u{2028}b\u{2029}c\u{AD}d\u{2062}e\u{FFF9}f\u{180E}"),
+            "a·b·c·d·e·f·"
+        );
+        assert_eq!(clean("ünïcödé.example"), "ünïcödé.example");
+    }
+
     #[test]
     fn hostile_text_is_escaped_and_bounded() {
-        let hostile = "\u{1b}]52;c;AAAA\u{7}\"},\\\u{202e}evil\u{200b}\n".repeat(500);
+        let hostile =
+            "\u{1b}]52;c;AAAA\u{7}\"},\\\u{202e}evil\u{200b}\n\u{2028}\u{ad}\u{e0065}".repeat(500);
         let mut p = annotated(packet());
         p.capture.as_mut().unwrap().interface = hostile.as_str().into();
         p.annotation.as_mut().unwrap().process_name = Some(hostile.clone());
@@ -1524,9 +1648,9 @@ mod tests {
         for key in ["process_name", "executable_identity", "sni", "alpn", "ja4"] {
             let value = comment[key].as_str().unwrap();
             assert_eq!(value.chars().count(), MAX_TEXT_CHARS, "{key}");
-            assert!(!value.chars().any(crate::ui::sanitize::is_unsafe), "{key}");
+            assert!(!value.chars().any(unsafe_or_invisible), "{key}");
         }
-        assert!(!name.chars().any(crate::ui::sanitize::is_unsafe));
+        assert!(!name.chars().any(unsafe_or_invisible));
         assert_eq!(comment["app"], "tls");
         assert_eq!(comment["ech_outer"], true);
     }
@@ -1625,7 +1749,7 @@ mod tests {
         let file = dir.join("mixed.pcapng");
         let _ = std::fs::remove_file(&file);
         export_capture(&[p.clone(), raw], &file, Format::PcapNg, true, &never).unwrap();
-        let hostile = "\u{1b}]52;c;AAAA\u{7}\"},\\\u{202e}evil\n".repeat(50);
+        let hostile = "\u{1b}]52;c;AAAA\u{7}\"},\\\u{202e}evil\n\u{2028}\u{e0065}".repeat(50);
         let mut h = p;
         h.capture.as_mut().unwrap().interface = hostile.as_str().into();
         h.annotation.as_mut().unwrap().process_name = Some(hostile.clone());
@@ -1649,12 +1773,21 @@ mod tests {
                     .unwrap();
             assert_eq!(summary, ExportSummary::default());
             let data = std::fs::read(&file).unwrap();
+            // libpcap opens it: a PCAPNG section needs an interface for that.
+            #[cfg(not(windows))]
+            assert!(pcap::Capture::from_file(&file)
+                .unwrap()
+                .next_packet()
+                .is_err());
             std::fs::remove_file(file).unwrap();
             match format {
                 Format::Pcap => assert_eq!(data.len(), 24),
                 Format::PcapNg => {
                     let (interfaces, packets) = read_pcapng(&data);
-                    assert!(interfaces.is_empty() && packets.is_empty());
+                    assert!(packets.is_empty());
+                    assert_eq!(interfaces.len(), 1);
+                    let i = &interfaces[0];
+                    assert_eq!((i.link_type, i.name.as_deref(), i.tsresol), (1, None, 6));
                 }
             }
         }

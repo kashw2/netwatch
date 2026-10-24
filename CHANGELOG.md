@@ -25,13 +25,14 @@ All notable changes to NetWatch will be documented in this file.
 - **PCAPNG export, with the owning process in each packet's comment.** `w`
   in Packets and `Shift+E` for an incident now open a preview that freezes
   the selection, counts what will be written and what will be left out, and
-  warns that packet bytes are not redacted. `Enter` writes in the
+  warns that packet bytes are not redacted. `w` takes the packets the list
+  shows, so with `x` on only the expert findings. `Enter` writes in the
   background, `f` picks PCAPNG (the default) or classic PCAP, `a` turns
   comments off, and `Esc` cancels. Each PCAPNG packet's comment is a JSON
   object Wireshark shows under "Packet comments": the process, PID and
-  direction when two connection-table polls either side of the packet agree
-  on the socket's owner (Linux), else `unknown_owner`, plus the DPI
-  classification, SNI and JA4. One file can hold packets from several
+  direction when two checks of the socket's owner, one finished before the
+  packet and one begun after it, agree on it (Linux), else `unknown_owner`,
+  plus the DPI classification, SNI and JA4. One file can hold packets from several
   interfaces and link types. The format and every comment key are specified
   in REFERENCE.md, "Capture export".
 
@@ -41,8 +42,9 @@ All notable changes to NetWatch will be documented in this file.
   "close this" (#94). `Ctrl+C` still quits from anywhere.
 - **Incident bundles hold `packets.pcapng`, and `manifest.json` is version
   2.** `packets.pcap` is still written when every packet shares one link
-  type. The manifest lists the packet files present, how many packets were
-  written, left out and annotated, and the capture's last drop count. The
+  type and is dated before 2106. The manifest lists the packet files
+  present, how many packets were written, left out and annotated, and the
+  capture's last drop count. The
   bundle directory name ends in a short random suffix, so exporting the same
   incident twice gives two bundles instead of overwriting one.
 - **Frames from interfaces that are not Ethernet appear in Packets as

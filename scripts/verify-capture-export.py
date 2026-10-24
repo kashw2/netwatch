@@ -64,7 +64,7 @@ def capinfos(name):
 
 def safe(text):
     """No control, format (bidi, zero-width) or line-breaking characters."""
-    return not any(unicodedata.category(c) in ("Cc", "Cf") for c in text)
+    return not any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") for c in text)
 
 
 for name in ("single.pcap", "single.pcapng"):

@@ -329,9 +329,9 @@ impl IncidentRecorder {
                 cancel,
             )?;
             artifacts.push("packets.pcapng".into());
-            // Classic PCAP has one link type per file; a mixed capture is
-            // only in the PCAPNG.
-            if export::single_link_type(&packets) {
+            // Classic PCAP has one link type per file and 32-bit seconds; a
+            // capture it cannot hold is only in the PCAPNG, never refused.
+            if export::fits_pcap(&packets) {
                 export::export_capture(
                     &packets,
                     &dir.join("packets.pcap"),
@@ -1054,32 +1054,41 @@ mod tests {
         assert_eq!((preview.packets, preview.annotated), (2, 1));
     }
 
+    /// A capture classic PCAP cannot hold, with two link types or a time
+    /// past its 32-bit seconds, is bundled as PCAPNG only, not refused.
     #[test]
-    fn a_mixed_link_capture_bundles_pcapng_only() {
-        let mut recorder = IncidentRecorder::new();
-        recorder.arm();
-        let mut tunnel = make_packet(2, "Raw", ExpertSeverity::Chat);
-        tunnel.capture.as_mut().unwrap().link_type = 101;
-        let mut demo = make_packet(3, "DNS", ExpertSeverity::Chat);
-        demo.capture = None;
-        record_packets(
-            &mut recorder,
-            &[make_packet(1, "TCP", ExpertSeverity::Chat), tunnel, demo],
-        );
-        recorder.freeze("mixed").unwrap();
-        let root = scratch("mixed");
-        let bundle = recorder.export_bundle(&root).unwrap();
-        assert!(bundle.join("packets.pcapng").exists());
-        assert!(!bundle.join("packets.pcap").exists());
-        let manifest = manifest(&bundle);
-        assert_eq!(
-            manifest["packet_artifacts"],
-            serde_json::json!(["packets.pcapng"])
-        );
-        assert_eq!(manifest["packet_export"]["packets"], 2);
-        assert_eq!(manifest["packet_export"]["omitted"], 1);
-        assert_eq!(manifest["packet_annotations"], true);
-        let _ = fs::remove_dir_all(&root);
+    fn a_capture_pcap_cannot_hold_bundles_pcapng_only() {
+        for mixed in [true, false] {
+            let mut recorder = IncidentRecorder::new();
+            recorder.arm();
+            let mut second = make_packet(2, "Raw", ExpertSeverity::Chat);
+            let meta = second.capture.as_mut().unwrap();
+            if mixed {
+                meta.link_type = 101;
+            } else {
+                meta.timestamp_ns = (u64::from(u32::MAX) + 1) * 1_000_000_000;
+            }
+            let mut demo = make_packet(3, "DNS", ExpertSeverity::Chat);
+            demo.capture = None;
+            record_packets(
+                &mut recorder,
+                &[make_packet(1, "TCP", ExpertSeverity::Chat), second, demo],
+            );
+            recorder.freeze("mixed").unwrap();
+            let root = scratch("mixed");
+            let bundle = recorder.export_bundle(&root).unwrap();
+            assert!(bundle.join("packets.pcapng").exists(), "{mixed}");
+            assert!(!bundle.join("packets.pcap").exists(), "{mixed}");
+            let manifest = manifest(&bundle);
+            assert_eq!(
+                manifest["packet_artifacts"],
+                serde_json::json!(["packets.pcapng"])
+            );
+            assert_eq!(manifest["packet_export"]["packets"], 2);
+            assert_eq!(manifest["packet_export"]["omitted"], 1);
+            assert_eq!(manifest["packet_annotations"], true);
+            let _ = fs::remove_dir_all(&root);
+        }
     }
 
     #[test]

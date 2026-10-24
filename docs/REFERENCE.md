@@ -94,7 +94,8 @@ NetWatch ships the FoxIO BSD-3 lookup database and lets you overlay your own ent
 
 ### Capture export
 
-Press `w` in the Packets tab to export the packets the list shows, after any display filter.
+Press `w` in the Packets tab to export the packets the list shows, after any display filter
+and `x` (expert findings only).
 `Shift+E` does the same for a frozen [Flight Recorder](#flight-recorder) incident. Either one
 opens a preview first. The preview freezes the selection, counts what will be written and
 what will be left out, and says what the file will hold. `Enter` writes, `f` switches between
@@ -137,7 +138,7 @@ one little-endian section, with only these blocks:
 | Block | Contents |
 |-------|----------|
 | Section Header | Byte-order magic `0x1A2B3C4D`, version 1.0, section length -1 (unspecified). Option `shb_userappl`: `netwatch <version>` |
-| Interface Description | One per capture session, interface and link type, written before its first packet: LINKTYPE, snaplen 65535. Options `if_name` and `if_tsresol` = 6 (microseconds) |
+| Interface Description | One per capture session, interface and link type, written before its first packet: LINKTYPE, snaplen 65535. Options `if_name` and `if_tsresol` = 6 (microseconds). A file with no packets has one, Ethernet with no `if_name`, since libpcap cannot open a section without one |
 | Enhanced Packet | Interface ID, timestamp in microseconds since the Unix epoch, captured length, original length, packet bytes padded to 32 bits. Option `opt_comment` when comments are on |
 
 A block with options ends them with `opt_endofopt`; a block without has no options list.
@@ -161,7 +162,7 @@ A block with options ends them with `opt_endofopt`; a block without has no optio
 | `network_namespace` | string or null | owner | Its network namespace, e.g. `net:[4026531840]` |
 | `source` | string | owner | Which socket table named the owner: `procfs`, `ebpf`, `lsof`, `pktap` or `sockstat` |
 | `direction` | string | owner | `outbound` when the packet left from the socket's local end, else `inbound` |
-| `before_utc_ms`, `after_utc_ms` | integer | owner | Unix time in ms of the two connection-table polls either side of the packet |
+| `before_utc_ms`, `after_utc_ms` | integer | owner | Unix time in ms by which the earlier check of the owner had finished, and at which the later one began. The packet falls strictly between them |
 | `flow_generation` | integer | owner | netwatch's number for this socket and owner in this run; a socket that passes to another process gets a new one |
 | `capture_generation` | integer | owner | The stream index the packet belongs to, as the stream view numbers them |
 | `app` | string | flow classified | The DPI classifier that recognised the flow: `tls` `quic` `http` `dns` `ssh` `mqtt` `stun` `bittorrent` `netbios` `snmp` `ssdp` `ftp` `llmnr` `dhcp` `ntp` |
@@ -174,19 +175,24 @@ A block with options ends them with `opt_endofopt`; a block without has no optio
 first packets of a flow, captured before it was recognised, have none. Only the classifier's
 name is written: HTTP paths, SNMP communities, FTP commands and decrypted payloads are not.
 Text values come from other programs and from the network. They are cut to 160 characters, and
-any character that could hide or reorder text (control characters, bidi overrides, zero-width
-marks) becomes `·`. Readers should ignore keys they do not know.
+any character that could hide or reorder text (control and format characters, which include
+bidi overrides, zero-width marks and tag characters, and the line and paragraph separators)
+becomes `·`. Readers should ignore keys they do not know.
 
 **How a packet gets an owner.** netwatch polls the connection table about once a second. A
-packet is given the owner keys only when the polls either side of it, at most 5 s apart, both
-name the same process (same PID, start token, executable and namespace), the same socket and
-the same capture stream, and the packet's time falls strictly between them. Anything else
-stays `unknown_owner`: a single poll, a stale one, a socket that changed hands, both ends of a
-loopback connection, or a platform where netwatch cannot verify a process's identity (only
-Linux can today). The owner is recorded during capture and kept, so packets from a process
-that has since exited keep it, and nothing is looked up at export. It is a correlation of
-socket observations, not proof that the process sent the packet: a socket that opens and
-closes between two polls is never seen.
+packet is given the owner keys only when two consecutive polls both name the same process
+(same PID, start token, executable and namespace), the same socket and the same capture
+stream, and the packet falls strictly between the two checks of that owner: the earlier
+check had finished before the packet's time and the later one began after it, at most 5 s
+apart in all. A check is not always the poll. Sandboxed on Linux, netwatch reads socket
+owners from a separate `/proc` scan that runs every 0.5–5 s (the refresh rate) on its own
+schedule, so polls that share one scan bracket nothing, and packets after the latest scan
+wait for the next. Anything else stays `unknown_owner`: a single check, a stale one, a socket
+that changed hands, both ends of a loopback connection, or a platform where netwatch cannot
+verify a process's identity (only Linux can today). The owner is recorded during capture and
+kept, so packets from a process that has since exited keep it, and nothing is looked up at
+export. It is a correlation of socket observations, not proof that the process sent the
+packet: a socket that opens and closes between two checks is never seen.
 
 ---
 
@@ -251,7 +257,7 @@ netwatch_incident_20260403_103501_1a2b3c4d/
   dns.json         # query analytics
   alerts.json      # network-intelligence alert history
   packets.pcapng   # recorded packets, when any can be exported
-  packets.pcap     # as well, when they all share one link type
+  packets.pcap     # as well, when classic PCAP can hold them all
 ```
 
 `Shift+E` opens the same preview as a packet export ([Capture export](#capture-export)); an

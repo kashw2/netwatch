@@ -179,7 +179,7 @@ An exported incident bundle includes:
 - `bandwidth.json`
 - `dns.json`
 - `alerts.json`
-- `packets.pcapng` when any recorded packet can be exported, and `packets.pcap` as well when they share one link type (see "Capture export" in REFERENCE.md)
+- `packets.pcapng` when any recorded packet can be exported, and `packets.pcap` as well when they share one link type and are dated before 2106 (see "Capture export" in REFERENCE.md)
 
 The export format is implemented in `src/collectors/incident.rs`.
 

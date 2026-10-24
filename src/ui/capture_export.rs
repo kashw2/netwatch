@@ -121,6 +121,17 @@ impl Dialog {
         });
     }
 
+    /// What the file will hold with the current choices. Without comments,
+    /// or in classic PCAP, which has nowhere to put them, no packet names
+    /// its socket owner, as the write itself reports.
+    pub fn summary(&self) -> export::ExportSummary {
+        let mut summary = self.summary;
+        if !self.annotations || (!self.incident && self.format == Format::Pcap) {
+            summary.annotated = 0;
+        }
+        summary
+    }
+
     /// The final status once the worker has finished, `None` while it runs.
     pub fn poll(&mut self) -> Option<String> {
         match self.receiver.as_ref()?.try_recv() {
@@ -165,14 +176,15 @@ impl Dialog {
             "off"
         };
         let warning = Style::default().fg(t.status_warn);
+        let summary = self.summary();
         vec![
             Line::from(Span::styled(what, Style::default().fg(t.brand).bold())),
             Line::from(vec![
-                value(self.summary.packets.to_string()),
+                value(summary.packets.to_string()),
                 label(" packets to write · "),
-                value(self.summary.annotated.to_string()),
+                value(summary.annotated.to_string()),
                 label(" with a socket owner · "),
-                value(self.summary.omitted.to_string()),
+                value(summary.omitted.to_string()),
                 label(" omitted (no capture metadata)"),
             ]),
             Line::from(""),
@@ -324,6 +336,27 @@ mod tests {
             .unwrap()
             .contains("cancelled"));
         assert!(!path.exists());
+    }
+
+    /// The owner count is what the file will name: none without comments
+    /// or in classic PCAP.
+    #[test]
+    fn the_owner_count_follows_the_format_and_comments() {
+        let mut dialog = Dialog::new(Selection::Packets(vec![]), std::env::temp_dir());
+        dialog.summary.packets = 5;
+        dialog.summary.annotated = 3;
+        let owners = |d: &Dialog| d.summary().annotated;
+        assert_eq!(owners(&dialog), 3);
+        assert!(screen(&dialog, 100, 30).contains("3 with a socket owner"));
+        press(&mut dialog, KeyCode::Char('a'));
+        assert_eq!(owners(&dialog), 0);
+        assert!(screen(&dialog, 100, 30).contains("0 with a socket owner"));
+        press(&mut dialog, KeyCode::Char('a'));
+        press(&mut dialog, KeyCode::Char('f'));
+        assert_eq!(owners(&dialog), 0);
+        press(&mut dialog, KeyCode::Char('f'));
+        assert_eq!(owners(&dialog), 3);
+        assert_eq!(dialog.summary().packets, 5);
     }
 
     #[test]

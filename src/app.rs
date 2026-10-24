@@ -3542,25 +3542,16 @@ fn handle_main_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
             app.ui.timeline_filter = app.ui.timeline_filter.cycle();
         }
         KeyCode::Char('w') if app.ui.current_tab == Tab::Packets => {
-            use crate::collectors::packets::{matches_packet, parse_filter};
-            let packets = app.packet_collector.get_packets();
-            let filtered: Vec<_>;
-            let to_export: &[_] = if let Some(ref ft) = app.ui.packet_filter_active {
-                if let Some(expr) = parse_filter(ft) {
-                    filtered = packets
-                        .iter()
-                        .filter(|p| matches_packet(&expr, p))
-                        .cloned()
-                        .collect();
-                    &filtered
-                } else {
-                    &packets
-                }
-            } else {
-                &packets
+            // What the list shows: the display filter and `x` both apply.
+            let shown = {
+                let packets = app.packet_collector.get_packets();
+                ui::packets::visible_packets(app, &packets)
+                    .into_iter()
+                    .cloned()
+                    .collect()
             };
             app.capture_export = Some(ui::capture_export::Dialog::new(
-                ui::capture_export::Selection::Packets(to_export.to_vec()),
+                ui::capture_export::Selection::Packets(shown),
                 export_dir(),
             ));
             app.ui.export_status_tick = 0;
@@ -4067,6 +4058,35 @@ mod quit_key_tests {
         handle_key(&mut app, key(KeyCode::Char('w')));
         let ctrl_c = crossterm::event::KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(handle_key(&mut app, ctrl_c));
+    }
+
+    /// `w` freezes the packets the list shows: with `x` on, only findings.
+    #[test]
+    fn w_exports_the_packets_the_list_shows() {
+        use crate::collectors::packets::ExpertSeverity;
+        let mut app = app(false);
+        app.ui.view_mode = ViewMode::Full;
+        app.ui.current_tab = Tab::Packets;
+        app.packet_collector.seed_demo_capture();
+        let (total, findings) = {
+            let mut packets = app.packet_collector.packets.write().unwrap();
+            for (i, p) in packets.iter_mut().enumerate() {
+                p.expert = if i % 3 == 0 {
+                    ExpertSeverity::Warn
+                } else {
+                    ExpertSeverity::Chat
+                };
+            }
+            (packets.len(), packets.len().div_ceil(3))
+        };
+        assert!(findings < total);
+        for (expert_only, shown) in [(false, total), (true, findings)] {
+            app.ui.packet_expert_only = expert_only;
+            handle_key(&mut app, key(KeyCode::Char('w')));
+            // Demo packets were never captured, so each is counted as omitted.
+            let summary = app.capture_export.take().unwrap().summary();
+            assert_eq!(summary.packets + summary.omitted, shown, "{expert_only}");
+        }
     }
 
     #[test]
