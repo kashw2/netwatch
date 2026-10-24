@@ -39,9 +39,14 @@ All notable changes to NetWatch will be documented in this file.
   toml 0.8 parsed through its own copy of toml_edit 0.22, next to the
   toml_edit 0.25 the egress policy writer uses; toml 1.x needs neither.
   config.toml and the egress policy are written byte for byte as before,
-  `--generate-config` included. config.toml can now also use TOML 1.1: an
-  inline table may span lines and end in a comma, and strings take `\e` and
-  `\xHH` escapes. Parse errors are worded a little differently.
+  `--generate-config` included. config.toml and egress-policy.toml can now
+  also use TOML 1.1: an inline table may span lines and end in a comma, and
+  strings take `\e` and `\xHH` escapes. netwatch 0.37 and earlier can't read
+  a file that does. They run on defaults in place of such a config.toml, and
+  they skip such an egress policy and enforce none of it, which shows only as
+  a log warning and in Diagnose coverage. Keep a file shared across machines,
+  such as a distributed egress policy, to TOML 1.0 until every host runs
+  0.38. Parse errors are worded a little differently.
 - **dirs 5 → 7.** Config, cache and state stay where they were on every
   platform. The one location dirs 7 moved, `preference_dir` on Windows, is
   not one netwatch uses.

@@ -1731,6 +1731,28 @@ ip = ["198.51.100.7"]
         );
     }
 
+    /// The policy loads through toml 1.x, so it takes TOML 1.1 syntax too.
+    /// 0.37 and earlier refuse such a file and enforce nothing, which the
+    /// CHANGELOG warns about for policies shared across mixed versions.
+    #[test]
+    fn policy_file_accepts_toml_1_1_syntax() {
+        let path = scratch("toml-1-1.toml");
+        write_owner_only(
+            &path,
+            br#"[process.curl]
+block = {
+    ip = ["203.0.113.7"],
+    sni = ["\x65vil.example"],
+}
+"#,
+        )
+        .unwrap();
+        let policy = load_policy_file(&path).expect("a TOML 1.1 policy loads");
+        let block = &policy.process["curl"].block;
+        assert_eq!(block.ip, vec!["203.0.113.7".to_string()]);
+        assert_eq!(block.sni, vec!["evil.example".to_string()]);
+    }
+
     #[test]
     fn observe_warns_on_drift_with_cooldown() {
         let mut p = EgressProfiler::new();
