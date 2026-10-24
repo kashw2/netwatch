@@ -34,6 +34,18 @@ rustPlatform.buildRustPackage {
   preVersionCheck = ''
     version=${cargoToml.package.version}
   '';
+  # The hook accepts substring matches and ignores the command's exit status.
+  # Preserve the strict smoke check that previously ran in the CI workflow.
+  postVersionCheck = ''
+    actualVersion=$("$out/bin/netwatch" --version) || {
+      echo "netwatch --version failed" >&2
+      exit 1
+    }
+    if [[ "$actualVersion" != "netwatch ${cargoToml.package.version}" ]]; then
+      echo "Unexpected netwatch version: $actualVersion" >&2
+      exit 1
+    fi
+  '';
   doInstallCheck = true;
 
   meta = {
