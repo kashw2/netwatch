@@ -5,6 +5,7 @@
   pkg-config,
   libpcap,
   iproute2,
+  versionCheckHook,
   # Short git revision, passed by the flake so builds between releases are distinguishable; null outside a git checkout.
   rev ? null,
 }:
@@ -26,6 +27,14 @@ rustPlatform.buildRustPackage {
 
   # The Linux connection collector shells out to `ss`
   nativeCheckInputs = lib.optionals stdenv.hostPlatform.isLinux [ iproute2 ];
+
+  nativeInstallCheckInputs = [ versionCheckHook ];
+  versionCheckProgramArg = "--version";
+  # `netwatch --version` prints the bare Cargo version, without the `+git.<rev>` suffix
+  preVersionCheck = ''
+    version=${cargoToml.package.version}
+  '';
+  doInstallCheck = true;
 
   meta = {
     description = "Real-time network diagnostics in your terminal — like htop for your network";
