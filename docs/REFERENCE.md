@@ -1,14 +1,15 @@
 # NetWatch — Feature Reference
 
 The complete reference for NetWatch: every keybinding, the display-filter language, the
-protocol decoders, TLS decryption, JA4 hunting, the sandbox, the Flight Recorder, themes,
-and configuration. For a quick start, see the [README](../README.md); for architecture and
+protocol decoders, TLS decryption, JA4 hunting, the capture export format, the sandbox, the
+Flight Recorder, themes, and configuration. For a quick start, see the [README](../README.md); for architecture and
 maintenance notes, see [WIKI.md](WIKI.md).
 
 - [Deep Packet Inspection](#deep-packet-inspection)
   - [Protocol decoders](#protocol-decoders)
   - [TLS 1.3 / 1.2 decryption](#tls-13--12-decryption)
   - [Threat hunting with JA4](#threat-hunting-with-ja4)
+  - [Capture export](#capture-export)
 - [Display filters](#display-filters)
 - [Security & Forensics](#security--forensics)
   - [Network intelligence](#network-intelligence)
