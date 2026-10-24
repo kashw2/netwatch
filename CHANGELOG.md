@@ -45,6 +45,21 @@ All notable changes to NetWatch will be documented in this file.
   Process", since no process owns it any more. The connection detail's
   Match line says `IpHelper`. netstat and tasklist are used only if those
   calls fail.
+- **Windows: interface counters, the default route and adapter GUIDs come
+  from the IP Helper API.** The Interfaces tab and traffic graphs read
+  `GetIfTable2` each tick, where netwatch used to start PowerShell for
+  Get-NetAdapterStatistics on every tick, at 300-800 ms a call. The default
+  capture interface and the gateway come from the routing table
+  (`GetIpForwardTable2`), ranked by route plus interface metric as Windows
+  ranks them, instead of from Get-NetRoute and `route print`. Capture finds
+  an adapter's Npcap device by the GUID `GetAdaptersAddresses` reports
+  rather than by asking Get-NetAdapter. Counters cover the adapters the
+  Interfaces tab lists and, as Get-NetAdapterStatistics did, NICs with IP
+  unbound, such as a capture-only NIC or the physical NIC under a Hyper-V
+  external switch. Packet counts now include broadcast and multicast, as
+  they do on Linux and macOS, from the API and its fallbacks alike.
+  PowerShell, `route print` and `netstat -e` remain only as fallbacks for
+  when an API call fails.
 
 ### Fixed
 - **Lite view: keys no longer overflow in a terminal smaller than its
@@ -92,6 +107,26 @@ All notable changes to NetWatch will be documented in this file.
   Windows, report. A closing row in the Dense view drew as live, with its
   state cut to `TIME-WA…`, and a `CLOSE-WAIT` or `FIN-WAIT` row in the
   Connections view was muted instead of drawn in the error colour.
+- **Windows: DNS servers are found on non-English Windows, and IPv6 ones
+  are read whole.** They came from `ipconfig /all` by its English label, so
+  on a French ("Serveurs DNS") or Russian ("DNS-серверы") install none were
+  found and the Health widget had no resolver to probe. An IPv6 server such
+  as `2001:db8::53%12` was cut at its last colon to `53%12`, further IPv6
+  servers were skipped, and another adapter's gateway could be listed as a
+  DNS server. They now come from `GetAdaptersAddresses` in any display
+  language: the default-route adapter's first, and without the
+  `fec0:0:0:ffff::1` placeholders Windows reports when no IPv6 resolver is
+  set. A link-local server keeps its zone index (`fe80::1%12`), as on Linux
+  and macOS, and the probes pass it over as they do there rather than send
+  to whichever link Windows picks. The ipconfig fallback reads IPv6 servers
+  correctly as well.
+- **Windows: the gateway is an address with a VPN up.** `route print` lists
+  default routes unsorted, and a VPN's on-link default shows "On-link" in the
+  gateway column, which the Health widget could then try to probe as the
+  gateway. The gateway is now the next hop of the lowest-metric default route
+  that has one. Where either old parse went wrong, the gateway or resolvers
+  in the network's Diagnose baseline key change with these two fixes, so
+  Diagnose relearns that network's baselines once after the upgrade.
 
 ### Dependencies
 - **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**
