@@ -2657,8 +2657,11 @@ fn parse_tcp(
         let (label, summary) = describe_app_protocol(&ap);
         details.push(format!("{label}: {summary}"));
         let info = format!(
-            "{}:{} → {}:{} {} [{}]",
-            src_ip, src_port, dst_ip, dst_port, summary, flag_str
+            "{} → {} {} [{}]",
+            format_endpoint(src_ip, src_port),
+            format_endpoint(dst_ip, dst_port),
+            summary,
+            flag_str
         );
         return (
             label.to_string(),
@@ -2673,11 +2676,9 @@ fn parse_tcp(
 
     let payload_len = payload.len();
     let info = format!(
-        "{}:{} → {}:{} [{}] Seq={} Win={}{} Payload={}",
-        src_ip,
-        src_port,
-        dst_ip,
-        dst_port,
+        "{} → {} [{}] Seq={} Win={}{} Payload={}",
+        format_endpoint(src_ip, src_port),
+        format_endpoint(dst_ip, dst_port),
         flag_str,
         seq,
         window,
@@ -2733,8 +2734,10 @@ fn parse_udp(
         let (label, summary) = describe_app_protocol(&ap);
         details.push(format!("{label}: {summary}"));
         let info = format!(
-            "{}:{} → {}:{} {}",
-            src_ip, src_port, dst_ip, dst_port, summary
+            "{} → {} {}",
+            format_endpoint(src_ip, src_port),
+            format_endpoint(dst_ip, dst_port),
+            summary
         );
         return (
             label.to_string(),
@@ -2749,11 +2752,9 @@ fn parse_udp(
 
     let svc = if dst_svc != "—" { dst_svc } else { src_svc };
     let info = format!(
-        "{}:{} → {}:{} Len={}{}",
-        src_ip,
-        src_port,
-        dst_ip,
-        dst_port,
+        "{} → {} Len={}{}",
+        format_endpoint(src_ip, src_port),
+        format_endpoint(dst_ip, dst_port),
         udp_len,
         if svc != "—" {
             format!(" ({})", svc)
@@ -3116,8 +3117,8 @@ fn extract_readable_payload(payload: &[u8]) -> String {
 
 // ── Helpers (formatting extracted to format.rs) ──
 mod format;
-pub(crate) use format::canonical_ip;
 pub use format::port_label;
+pub(crate) use format::{canonical_ip, format_endpoint};
 use format::{
     format_ipv6, format_mac, icmp_type_name, icmpv6_type_name, ip_protocol_name, parse_arp,
     tcp_flags,
@@ -3364,6 +3365,26 @@ mod tests {
             let octets = text.parse::<std::net::Ipv6Addr>().unwrap().octets();
             assert_eq!(format_ipv6(&octets), want, "{text}");
         }
+    }
+
+    /// An endpoint reads back as the address and port it names. Compressed
+    /// IPv6 with `:port` appended does not: `2001:db8::20:53` is itself the
+    /// address 2001:db8::20:53, so the port goes outside brackets.
+    #[test]
+    fn an_endpoint_reads_back_as_its_address_and_port() {
+        for (ip, port, want) in [
+            ("2001:db8::20", 53, "[2001:db8::20]:53"),
+            ("::1", 8080, "[::1]:8080"),
+            ("::ffff:192.0.2.1", 443, "[::ffff:192.0.2.1]:443"),
+            ("192.0.2.1", 443, "192.0.2.1:443"),
+        ] {
+            let text = format_endpoint(ip, port);
+            assert_eq!(text, want);
+            let back: std::net::SocketAddr = text.parse().unwrap();
+            assert_eq!((back.ip(), back.port()), (ip.parse().unwrap(), port));
+        }
+        // A resolved name has no colon to confuse.
+        assert_eq!(format_endpoint("dns.google", 53), "dns.google:53");
     }
 
     // ── parse_ip / canonical_ip ─────────────────────────────
@@ -5019,6 +5040,32 @@ mod tests {
 
     /// macOS `lsof` drops the opening bracket of a link-local endpoint and
     /// embeds the interface in its second group; neither is on the wire.
+    /// Each end of an IPv6 packet's Info line names its peer and port. With
+    /// the port appended bare, `2001:db8::20:22` read as another host, and
+    /// pasting it into the filter matched nothing.
+    #[test]
+    fn ipv6_info_names_each_end_with_its_port() {
+        let (_, packets) = replay_ssh("[2001:db8::10]:50022", "[2001:db8::20]:22");
+        for p in &packets {
+            let (src, rest) = p.info.split_once(" → ").expect("two ends");
+            let dst = rest.split_whitespace().next().unwrap();
+            for (end, ip, port) in [(src, &p.src_ip, p.src_port), (dst, &p.dst_ip, p.dst_port)] {
+                let addr: std::net::SocketAddr = end
+                    .parse()
+                    .unwrap_or_else(|e| panic!("{end}: {e} in {}", p.info));
+                assert_eq!(
+                    (addr.ip().to_string(), Some(addr.port())),
+                    (ip.clone(), port),
+                    "{}",
+                    p.info
+                );
+            }
+        }
+        assert!(packets[3]
+            .info
+            .starts_with("[2001:db8::20]:22 → [2001:db8::10]:50022 "));
+    }
+
     #[test]
     fn a_macos_link_local_row_joins_its_stream() {
         let (replay, packets) = replay_ssh(

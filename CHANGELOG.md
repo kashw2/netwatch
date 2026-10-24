@@ -200,12 +200,20 @@ All notable changes to NetWatch will be documented in this file.
   PCAPNG export; and `Enter` on the row opened an empty Packets list, as it
   also did for a dual-stack socket's `::ffff:192.0.2.1` peer. Capture now
   writes IPv6 in the standard compressed form (RFC 5952) in the packet list
-  and details. Rows also join when `ss` adds a `%dev` zone and when macOS
+  and details, copied packets, the timeline and alerts, and puts an IPv6
+  address followed by a port in brackets, `[2001:db8::1]:443`, as the
+  Connections tab does: unbracketed, `2001:db8::1:443` is a different
+  address. Rows also join when `ss` adds a `%dev` zone and when macOS
   `lsof` writes the interface into a link-local address. Display filters
   take an address in any of those spellings, and `ip.addr == X` as Wireshark
   writes it; a whole address now matches only itself, so `10.0.0.1` no
   longer also shows `10.0.0.10`. IPv6 loopback traffic no longer reaches the
-  beaconing detector as if it were external.
+  beaconing detector as if it were external. The Egress tab and its NDJSON
+  export now see SNI and byte counts for IPv6 destinations too, so policy
+  verdicts, `netwatch_policy_violations_total` and Diagnose's egress check
+  can change after upgrading: an `allow_sni` list stops flagging allowed
+  IPv6 traffic that had no name before, and a `deny_sni` list now catches
+  IPv6 traffic it used to miss.
 
 ### Dependencies
 - **toml 0.8 → 1.1, so the tree carries one TOML parser rather than two.**

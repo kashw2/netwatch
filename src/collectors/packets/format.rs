@@ -64,6 +64,20 @@ pub(crate) fn canonical_ip(text: &str) -> Option<String> {
     parse_ip(text).map(|ip| ip.to_string())
 }
 
+/// One end of a conversation as people read and paste it: `host:port`, with
+/// an IPv6 address in brackets (`[2001:db8::20]:53`) as RFC 5952 section 6
+/// asks and the connection table prints. Compressed IPv6 has no fixed group
+/// count, so an unbracketed port reads as one more group, and
+/// `2001:db8::20:53` is itself the address of a different host. A host name
+/// or an IPv4 address is written as is.
+pub(crate) fn format_endpoint(host: &str, port: impl std::fmt::Display) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 pub(crate) fn tcp_flags(flags: u8) -> String {
     let mut s = Vec::new();
     if flags & TCP_FLAG_FIN != 0 {
