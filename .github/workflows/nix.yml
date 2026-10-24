@@ -33,12 +33,7 @@ jobs:
       - name: Evaluate the flake on every system
         run: nix flake check --all-systems --no-build
 
+      # checkPhase runs the test suite; installCheckPhase (versionCheckHook)
+      # runs the built binary's `--version` against Cargo.toml.
       - name: Build and test the package
         run: nix build -L .#default
-
-      - name: Run the built binary
-        run: |
-          want=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
-          got=$(./result/bin/netwatch --version)
-          echo "$got"
-          test "$got" = "netwatch $want"
