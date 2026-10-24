@@ -278,6 +278,14 @@ All notable changes to NetWatch will be documented in this file.
   unmaintained crate ratatui 0.27 built with, is gone from the tree.
 
 ### CI
+- **The Nix flake is built in CI.** A new workflow runs `nix build`, test
+  suite included, on every change and once a week, evaluates the flake for
+  every system it declares, and checks that the built binary reports the
+  Cargo.toml version. The flake had stopped building without anyone
+  noticing until #105, from @kashw2, fixed it and made it read its version
+  from Cargo.toml. The flake now lists x86_64-linux, aarch64-linux and
+  aarch64-darwin only: nixpkgs dropped Intel Macs in 26.11, and listing
+  them made the flake fail to evaluate.
 - **CI fails when Windows code compares English command output.** A test
   reads the source as a Windows build compiles it and fails on any
   comparison with English that ping, tracert, ipconfig, netstat, netsh or
