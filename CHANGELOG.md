@@ -34,6 +34,20 @@ All notable changes to NetWatch will be documented in this file.
   80×24 check the renderer makes, so in a terminal under about 40 columns
   every key overflowed.
 
+### Dependencies
+- **ureq 2 → 3.5 and webpki-roots 0.26 → 1.** The remote publisher, the geo
+  and whois lookups and AI insights behave as before. They keep their
+  timeouts, connect directly even when `HTTPS_PROXY` is set, which ureq 3
+  would otherwise honour, follow at most four redirects and send compact
+  JSON. Two things differ. An ingest POST answered with a 307 or 308 is now
+  retried, where ureq 2 counted it as delivered and dropped the batch. AI
+  insights now use the shared client, so the Ollama endpoint gets 5 s to
+  accept the connection and still 30 s to answer. The diagnose load test
+  no longer uploads through ureq, because ureq 3 takes a custom resolver
+  only through an API outside semver. It sends the same 25 MB over the
+  cancellable lookup and sockets the other probes use, and still never
+  follows a redirect. Only one webpki-roots remains in the build.
+
 ## [0.37.0] - 2026-10-22
 
 ### Dependencies

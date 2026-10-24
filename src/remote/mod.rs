@@ -61,6 +61,16 @@ fn outcome_for_status(code: u16) -> SendOutcome {
     }
 }
 
+/// Classify a POST that failed. The shared agent reports 4xx and 5xx as
+/// `StatusCode`. Anything else is transient: DNS, connect, TLS, a timeout,
+/// or a 307 or 308 that ureq will not resend a body to.
+fn outcome_for_error(e: &ureq::Error) -> SendOutcome {
+    match e {
+        ureq::Error::StatusCode(code) => outcome_for_status(*code),
+        _ => SendOutcome::Retry,
+    }
+}
+
 /// Cheap entropy for backoff jitter — low bits of the wall clock. No RNG dep,
 /// and good enough to desynchronize a reconnecting fleet's retries.
 fn jitter_entropy() -> u64 {
@@ -77,7 +87,8 @@ fn jitter_entropy() -> u64 {
 /// than failing every POST later. The URL itself is left out of the errors,
 /// since it can carry credentials of its own.
 pub fn check_url(url: &str, allow_insecure: bool) -> anyhow::Result<()> {
-    // Parsed the way ureq will parse it, so `HTTP://` is http too.
+    // The scheme is case-insensitive here as it is to ureq, so `HTTP://` is
+    // http too.
     let parsed = url::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid remote URL: {e}"))?;
     match parsed.scheme() {
         "https" => Ok(()),
@@ -337,18 +348,21 @@ fn try_flush_once(
 
     let mut request = crate::http::agent()
         .post(endpoint)
-        .set("Authorization", &format!("Bearer {}", api_key))
-        .set("Content-Type", "application/json");
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json");
     if let Some(deadline) = deadline {
-        request = request.timeout(deadline.saturating_duration_since(Instant::now()));
+        request = request
+            .config()
+            .timeout_global(Some(deadline.saturating_duration_since(Instant::now())))
+            .build();
     }
-    let result = request.send_json(body);
+    // Compact, as ureq 2's send_json wrote it. ureq 3's pretty-prints, which
+    // would grow every batch by its indentation.
+    let result = request.send(body.to_string());
 
     let outcome = match &result {
         Ok(_) => SendOutcome::Ack,
-        Err(ureq::Error::Status(code, _)) => outcome_for_status(*code),
-        // Transport-level (DNS, connect, TLS, timeout) — transient.
-        Err(ureq::Error::Transport(_)) => SendOutcome::Retry,
+        Err(e) => outcome_for_error(e),
     };
 
     match outcome {
@@ -705,6 +719,88 @@ mod tests {
         // Server errors recover.
         assert_eq!(outcome_for_status(500), SendOutcome::Retry);
         assert_eq!(outcome_for_status(503), SendOutcome::Retry);
+    }
+
+    #[test]
+    fn failed_posts_are_classified_by_status_or_retried() {
+        use ureq::Error as E;
+        assert_eq!(outcome_for_error(&E::StatusCode(401)), SendOutcome::Poison);
+        assert_eq!(outcome_for_error(&E::StatusCode(429)), SendOutcome::Retry);
+        assert_eq!(outcome_for_error(&E::StatusCode(503)), SendOutcome::Retry);
+        for transient in [
+            E::Timeout(ureq::Timeout::Global),
+            E::HostNotFound,
+            E::RedirectFailed,
+            E::Io(std::io::ErrorKind::ConnectionRefused.into()),
+        ] {
+            assert_eq!(outcome_for_error(&transient), SendOutcome::Retry);
+        }
+    }
+
+    /// Answer one ingest POST with `status` and hand back the request head,
+    /// lowercased, and the body.
+    fn ingest_once(status: &'static str) -> (String, thread::JoinHandle<(String, String)>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/api/v1/ingest", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while !buf.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                buf.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+            let len = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).unwrap();
+            let reply =
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(reply.as_bytes());
+            (head, String::from_utf8(body).unwrap())
+        });
+        (endpoint, server)
+    }
+
+    /// The real round trip through the shared agent: 2xx acknowledges, a 4xx
+    /// drops the batch, a 5xx keeps it.
+    #[test]
+    fn the_backend_status_decides_what_happens_to_the_batch() {
+        for (status, outcome, left) in [
+            ("202 Accepted", SendOutcome::Ack, 0),
+            ("401 Unauthorized", SendOutcome::Poison, 0),
+            ("503 Service Unavailable", SendOutcome::Retry, 1),
+        ] {
+            let (endpoint, server) = ingest_once(status);
+            let queue = SnapshotQueue::new(QUEUE_CAP);
+            queue.push(json!({"n": 1}));
+            let got = try_flush_once(
+                &endpoint,
+                "key",
+                &json!({}),
+                &AtomicBool::new(true),
+                &queue,
+                Some(Instant::now() + Duration::from_secs(5)),
+            );
+            assert_eq!(got, Some(outcome), "{status}");
+            assert_eq!(queue.len(), left, "{status}");
+            let (head, body) = server.join().unwrap();
+            assert!(head.starts_with("post /api/v1/ingest "), "{head}");
+            assert!(head.contains("authorization: bearer key\r\n"), "{head}");
+            assert!(
+                head.contains("content-type: application/json\r\n"),
+                "{head}"
+            );
+            // The envelope, compact on one line as it always was.
+            assert!(!body.contains('\n'), "{body}");
+            let envelope: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(envelope["schema_version"], SCHEMA_VERSION);
+            assert_eq!(envelope["snapshots"], json!([{"n": 1}]));
+        }
     }
 
     #[test]
