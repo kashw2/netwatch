@@ -35,9 +35,13 @@ All notable changes to NetWatch will be documented in this file.
   (`GetIpForwardTable2`), ranked by route plus interface metric as Windows
   ranks them, instead of from Get-NetRoute and `route print`. Capture finds
   an adapter's Npcap device by the GUID `GetAdaptersAddresses` reports
-  rather than by asking Get-NetAdapter. Packet counts now include broadcast
-  and multicast, as they do on Linux and macOS. PowerShell, `route print` and
-  `netstat -e` remain only as fallbacks for when an API call fails.
+  rather than by asking Get-NetAdapter. Counters cover the adapters the
+  Interfaces tab lists and, as Get-NetAdapterStatistics did, NICs with IP
+  unbound, such as a capture-only NIC or the physical NIC under a Hyper-V
+  external switch. Packet counts now include broadcast and multicast, as
+  they do on Linux and macOS, from the API and its fallbacks alike.
+  PowerShell, `route print` and `netstat -e` remain only as fallbacks for
+  when an API call fails.
 
 ### Fixed
 - **Lite view: keys no longer overflow in a terminal smaller than its
@@ -51,15 +55,19 @@ All notable changes to NetWatch will be documented in this file.
   as `2001:db8::53%12` was cut at its last colon to `53%12`, further IPv6
   servers were skipped, and another adapter's gateway could be listed as a
   DNS server. They now come from `GetAdaptersAddresses` in any display
-  language: the default-route adapter's first, without the zone index the
-  probe cannot parse, and without the `fec0:0:0:ffff::1` placeholders Windows
-  reports when no IPv6 resolver is set. The ipconfig fallback reads IPv6
-  servers correctly as well.
+  language: the default-route adapter's first, and without the
+  `fec0:0:0:ffff::1` placeholders Windows reports when no IPv6 resolver is
+  set. A link-local server keeps its zone index (`fe80::1%12`), as on Linux
+  and macOS, and the probes pass it over as they do there rather than send
+  to whichever link Windows picks. The ipconfig fallback reads IPv6 servers
+  correctly as well.
 - **Windows: the gateway is an address with a VPN up.** `route print` lists
   default routes unsorted, and a VPN's on-link default shows "On-link" in the
   gateway column, which the Health widget could then try to probe as the
   gateway. The gateway is now the next hop of the lowest-metric default route
-  that has one.
+  that has one. Where either old parse went wrong, the gateway or resolvers
+  in the network's Diagnose baseline key change with these two fixes, so
+  Diagnose relearns that network's baselines once after the upgrade.
 
 ### Dependencies
 - **windows-sys 0.61, on Windows only.** The IP Helper calls use its

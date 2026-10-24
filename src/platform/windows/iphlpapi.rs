@@ -8,7 +8,7 @@
 //! buffer is alive; the decoding and every choice made from it live there,
 //! where they are tested on every platform.
 
-use super::super::ip_helper::{self, Adapter, IfCounters, Route};
+use super::super::ip_helper::{self, Adapter, IfCounters, IfRow, Route};
 use super::{InterfaceInfo, InterfaceStats};
 use std::collections::HashMap;
 use std::ffi::CStr;
@@ -76,10 +76,11 @@ pub fn adapter_guids() -> Result<HashMap<String, String>, u32> {
     Ok(ip_helper::adapter_guids(&adapters))
 }
 
-/// Per-interface counters, keyed by the names [`adapters`] returns.
+/// Per-interface counters, keyed by the names [`adapters`] returns, and for
+/// a NIC with IP unbound by its alias, which [`adapter_guids`] has too.
 pub fn interface_stats() -> Result<HashMap<String, InterfaceStats>, u32> {
     let adapters = read_adapters(FLAGS_IDENTITY)?;
-    Ok(ip_helper::stats_by_name(&adapters, &if_counters()?))
+    Ok(ip_helper::stats_by_name(&adapters, &if_rows()?))
 }
 
 /// Friendly name of the adapter carrying the best default route.
@@ -101,8 +102,9 @@ pub fn default_gateway() -> Result<Option<String>, u32> {
     )))
 }
 
-/// DNS servers, the default-route adapter's first, as addresses without a
-/// zone index. `collectors::config` falls back to ipconfig on `Err`.
+/// DNS servers, the default-route adapter's first: plain addresses, and a
+/// link-local one with its adapter's zone index. `collectors::config` falls
+/// back to ipconfig on `Err`.
 pub fn dns_servers() -> Result<Vec<String>, u32> {
     let adapters = read_adapters(FLAGS_CONFIG)?;
     // Without the routing table the order is the API's, which is still a
@@ -181,6 +183,7 @@ unsafe fn walk(first: *const IP_ADAPTER_ADDRESSES_LH) -> Vec<Adapter> {
                 gateways: list_ips(a.FirstGatewayAddress.cast_const(), |n| {
                     (n.Next.cast_const(), n.Address)
                 }),
+                ipv6_if_index: a.Ipv6IfIndex,
                 ipv4_metric: a.Ipv4Metric,
                 ipv6_metric: a.Ipv6Metric,
             }
@@ -288,8 +291,8 @@ impl<T> Drop for MibTable<T> {
     }
 }
 
-/// Every interface's counters from `GetIfTable2`, keyed by LUID.
-fn if_counters() -> Result<HashMap<u64, IfCounters>, u32> {
+/// Every row of `GetIfTable2`: counters, alias and flags.
+fn if_rows() -> Result<Vec<IfRow>, u32> {
     let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
     // SAFETY: `table` is a live out-pointer; on success the API stores a
     // table it allocated there, which `MibTable` frees.
@@ -307,12 +310,18 @@ fn if_counters() -> Result<HashMap<u64, IfCounters>, u32> {
             (*table.0).NumEntries as usize,
         )
     };
-    Ok(rows
-        .iter()
+    Ok(rows.iter().map(if_row).collect())
+}
+
+fn if_row(r: &MIB_IF_ROW2) -> IfRow {
+    IfRow {
         // SAFETY: as for `Adapter::luid` above, `Value` covers the whole
         // union.
-        .map(|r| (unsafe { r.InterfaceLuid.Value }, counters(r)))
-        .collect())
+        luid: unsafe { r.InterfaceLuid.Value },
+        alias: ip_helper::wide_array_text(&r.Alias),
+        flags: r.InterfaceAndOperStatusFlags._bitfield,
+        counters: counters(r),
+    }
 }
 
 fn counters(r: &MIB_IF_ROW2) -> IfCounters {
@@ -412,7 +421,8 @@ mod tests {
 
     /// The runner has a network: at least one adapter is up, and an up
     /// adapter has counters under the same name the interface list uses,
-    /// with traffic on them.
+    /// with traffic on them. A counter row outside the list is a NIC with IP
+    /// unbound, named as capture names it.
     #[test]
     fn live_up_adapter_has_counters() {
         let adapters = adapters().expect("GetAdaptersAddresses");
@@ -426,15 +436,19 @@ mod tests {
                 .is_some_and(|s| s.rx_bytes > 0 && s.tx_bytes > 0)),
             "no up adapter has traffic counters: {stats:?}"
         );
-        // Counters never name an interface the list does not have.
+        let guids = adapter_guids().expect("GetAdaptersAddresses");
         for name in stats.keys() {
-            assert!(adapters.iter().any(|a| &a.name == name), "{name}");
+            assert!(
+                adapters.iter().any(|a| &a.name == name) || guids.contains_key(name),
+                "{name} is neither listed nor an adapter capture can open"
+            );
         }
     }
 
     /// Whatever the routing table and adapters say, what reaches the probes
-    /// must parse as a plain address; and a host with a default route has a
-    /// resolver.
+    /// must parse as a plain address, or be a link-local resolver with the
+    /// zone index that makes the probes skip it; and a host with a default
+    /// route has a resolver.
     #[test]
     fn live_route_gateway_and_dns_are_probe_ready() {
         let names: Vec<String> = adapters()
@@ -453,7 +467,16 @@ mod tests {
         let dns = dns_servers().expect("GetAdaptersAddresses");
         println!("default route via {iface:?}, gateway {gateway:?}, dns {dns:?}");
         for server in &dns {
-            assert!(server.parse::<IpAddr>().is_ok(), "dns server {server}");
+            let addr = match server.split_once('%') {
+                Some((addr, zone)) => {
+                    assert!(zone.parse::<u32>().is_ok_and(|z| z != 0), "{server}");
+                    let ip: std::net::Ipv6Addr = addr.parse().expect("an IPv6 address");
+                    assert_eq!(ip.segments()[0] & 0xffc0, 0xfe80, "{server}");
+                    addr
+                }
+                None => server,
+            };
+            assert!(addr.parse::<IpAddr>().is_ok(), "dns server {server}");
         }
         if iface.is_some() {
             assert!(!dns.is_empty(), "a default route but no DNS server");

@@ -42,6 +42,9 @@ pub struct Adapter {
     pub unicast: Vec<IpAddr>,
     pub dns_servers: Vec<IpAddr>,
     pub gateways: Vec<IpAddr>,
+    /// `Ipv6IfIndex`, the zone index of the adapter's link; 0 when IPv6 is
+    /// not enabled on it.
+    pub ipv6_if_index: u32,
     /// Interface metrics. Windows ranks a route by its own metric plus the
     /// interface's, so a route's metric alone does not say which one wins.
     pub ipv4_metric: u32,
@@ -61,8 +64,11 @@ impl Adapter {
 /// The address in a Windows `SOCKADDR`, given its bytes. `sockaddr_in` keeps
 /// it at byte 4, `sockaddr_in6` at byte 8.
 ///
-/// The IPv6 scope id is dropped: the DNS and gateway probes and Diagnose all
-/// parse addresses with `IpAddr::from_str`, which rejects a zone index.
+/// The IPv6 scope id is dropped. The probes and Diagnose parse addresses
+/// with `IpAddr::from_str`, which rejects a zone index, and only a link-local
+/// address needs one: a link-local DNS server takes its adapter's instead
+/// (`dns_server_text`), and a link-local gateway is skipped
+/// (`default_gateway`).
 pub fn sockaddr_ip(raw: &[u8]) -> Option<IpAddr> {
     let family = u16::from_ne_bytes(raw.get(..2)?.try_into().ok()?);
     match family {
@@ -162,7 +168,16 @@ pub fn adapter_guids(adapters: &[Adapter]) -> HashMap<String, String> {
 }
 
 /// The text netwatch keeps for a DNS server address, or `None` for one to
-/// drop.
+/// drop. `zone` is the IPv6 interface index of the adapter the server is
+/// configured on.
+///
+/// A link-local server (`fe80::/10`) answers only on its own link, so it
+/// keeps the zone index, `fe80::1%12`, as ipconfig prints it and as Linux's
+/// resolv.conf and macOS's scutil give it. The probes then skip it as they do
+/// there, rather than send to whichever link Windows picks: Health reports a
+/// resolver it cannot use (issue #31) and Diagnose leaves it out of its
+/// lookups. The same router on two links stays two servers. With no zone
+/// there is no link to name, so it is dropped.
 ///
 /// An adapter with IPv6 enabled and no IPv6 resolver configured reports
 /// `fec0:0:0:ffff::1`, `::2` and `::3`. Those are site-local anycast
@@ -170,9 +185,10 @@ pub fn adapter_guids(adapters: &[Adapter]) -> HashMap<String, String> {
 /// normal network. ipconfig prints them, and a probe sent there would report
 /// 100% loss to a resolver the host never uses. Go's resolver drops the same
 /// range for the same reason.
-pub fn dns_server_text(ip: IpAddr) -> Option<String> {
+pub fn dns_server_text(ip: IpAddr, zone: u32) -> Option<String> {
     match ip {
         IpAddr::V6(v6) if (v6.segments()[0] & 0xffc0) == 0xfec0 => None,
+        IpAddr::V6(v6) if is_link_local_v6(&v6) => (zone != 0).then(|| format!("{v6}%{zone}")),
         ip if ip.is_unspecified() => None,
         ip => Some(ip.to_string()),
     }
@@ -196,8 +212,11 @@ pub fn dns_servers(adapters: &[Adapter], default_luid: Option<u64>) -> Vec<Strin
     let mut up: Vec<&Adapter> = adapters.iter().filter(|a| a.listed() && a.is_up).collect();
     up.sort_by_key(|a| rank(a));
     let mut out: Vec<String> = Vec::new();
-    for ip in up.iter().flat_map(|a| a.dns_servers.iter()) {
-        if let Some(text) = dns_server_text(*ip) {
+    let servers = up
+        .iter()
+        .flat_map(|a| a.dns_servers.iter().map(|ip| (*ip, a.ipv6_if_index)));
+    for (ip, zone) in servers {
+        if let Some(text) = dns_server_text(ip, zone) {
             if !out.contains(&text) {
                 out.push(text);
             }
@@ -219,6 +238,39 @@ pub struct IfCounters {
     pub out_nucast_pkts: u64,
     pub out_discards: u64,
     pub out_errors: u64,
+}
+
+/// `InterfaceAndOperStatusFlags` in a `MIB_IF_ROW2`: a C bitfield of
+/// BOOLEANs, `HardwareInterface` first, which MSVC lays out from the low bit
+/// and windows-sys exposes as the whole byte.
+pub const IF_ROW_HARDWARE_INTERFACE: u8 = 0x01;
+pub const IF_ROW_FILTER_INTERFACE: u8 = 0x02;
+
+/// One `MIB_IF_ROW2`, as far as netwatch reads it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IfRow {
+    pub luid: u64,
+    /// `Alias`: the interface's friendly name, which Get-NetAdapter shows as
+    /// `Name` and `GetAdaptersAddresses` as `FriendlyName`.
+    pub alias: String,
+    /// `InterfaceAndOperStatusFlags`.
+    pub flags: u8,
+    pub counters: IfCounters,
+}
+
+impl IfRow {
+    /// A NIC's own interface: hardware, and not one of the filter modules
+    /// NDIS stacks on it ("Ethernet-WFP Native MAC Layer LightWeight
+    /// Filter-0000"), which repeat its traffic under another name.
+    pub fn is_nic(&self) -> bool {
+        self.flags & IF_ROW_HARDWARE_INTERFACE != 0 && self.flags & IF_ROW_FILTER_INTERFACE == 0
+    }
+}
+
+/// A fixed-size UTF-16 field such as `MIB_IF_ROW2::Alias`, up to its NUL.
+pub fn wide_array_text(units: &[u16]) -> String {
+    let len = units.iter().position(|u| *u == 0).unwrap_or(units.len());
+    String::from_utf16_lossy(&units[..len])
 }
 
 /// One interface's counters as `InterfaceStats`.
@@ -243,23 +295,35 @@ pub fn interface_stats(name: &str, c: &IfCounters) -> InterfaceStats {
     }
 }
 
-/// Counters keyed by friendly name for the listed adapters, joined on LUID.
+/// Counters keyed by friendly name: the listed adapters', joined on LUID,
+/// and every other NIC's under its alias.
 ///
-/// The interface table also holds rows ipconfig never showed (the NDIS filter
-/// and WAN miniport interfaces), so it is the adapter list that decides which
-/// names appear, as Get-NetAdapterStatistics did.
-pub fn stats_by_name(
-    adapters: &[Adapter],
-    counters: &HashMap<u64, IfCounters>,
-) -> HashMap<String, InterfaceStats> {
-    adapters
-        .iter()
-        .filter(|a| a.listed())
-        .filter_map(|a| {
-            let c = counters.get(&a.luid)?;
-            Some((a.name.clone(), interface_stats(&a.name, c)))
-        })
-        .collect()
+/// The interface table also holds rows Get-NetAdapterStatistics never
+/// reported, the NDIS filter modules and the WAN miniports, so those are
+/// left out. The adapter list alone is too narrow, though: it has only
+/// adapters with IP bound, and Get-NetAdapterStatistics also reported a NIC
+/// with its protocols unbound, such as a capture-only NIC or the physical NIC
+/// under a Hyper-V external switch. Capture opens such a NIC by that name
+/// (`adapter_guids`), so its counters are kept under it too. Should two rows
+/// share a name, the first keeps it.
+pub fn stats_by_name(adapters: &[Adapter], rows: &[IfRow]) -> HashMap<String, InterfaceStats> {
+    let mut stats = HashMap::new();
+    for a in adapters.iter().filter(|a| a.listed()) {
+        if let Some(row) = rows.iter().find(|r| r.luid == a.luid) {
+            stats
+                .entry(a.name.clone())
+                .or_insert_with(|| interface_stats(&a.name, &row.counters));
+        }
+    }
+    for row in rows {
+        let in_list = adapters.iter().any(|a| a.luid == row.luid);
+        if row.is_nic() && !in_list && !row.alias.is_empty() {
+            stats
+                .entry(row.alias.clone())
+                .or_insert_with(|| interface_stats(&row.alias, &row.counters));
+        }
+    }
+    stats
 }
 
 /// One `MIB_IPFORWARD_ROW2`, as far as netwatch reads it.
@@ -479,37 +543,43 @@ mod tests {
         );
     }
 
-    /// The probe parses the server with `IpAddr::from_str`, so the text
-    /// must carry no zone index, and Windows' placeholder fec0 servers must
-    /// not be the one it picks.
+    /// A routable server is a plain address the probes parse. A link-local
+    /// one keeps its zone, which they do not parse, so they skip it as they
+    /// do on Linux and macOS instead of sending to a link Windows picks
+    /// (issue #31). Windows' placeholder fec0 servers must not be the one
+    /// they pick either.
     #[test]
-    fn dns_server_text_drops_zone_and_site_local_placeholders() {
+    fn dns_server_text_zones_link_local_and_drops_placeholders() {
         assert_eq!(
-            dns_server_text(v4("192.168.1.1")).as_deref(),
+            dns_server_text(v4("192.168.1.1"), 12).as_deref(),
             Some("192.168.1.1")
         );
         assert_eq!(
-            dns_server_text(v6("2001:4860:4860::8888")).as_deref(),
+            dns_server_text(v6("2001:4860:4860::8888"), 12).as_deref(),
             Some("2001:4860:4860::8888")
         );
-        let text = dns_server_text(v6("fe80::1")).unwrap();
-        assert_eq!(text, "fe80::1");
-        assert!(text.parse::<IpAddr>().is_ok());
+        let text = dns_server_text(v6("fe80::1"), 12).unwrap();
+        assert_eq!(text, "fe80::1%12");
+        assert!(text.parse::<IpAddr>().is_err());
+        // Without a zone it could only be sent to some link or other.
+        assert_eq!(dns_server_text(v6("fe80::1"), 0), None);
         for placeholder in ["fec0:0:0:ffff::1", "fec0:0:0:ffff::2", "fec0:0:0:ffff::3"] {
-            assert_eq!(dns_server_text(v6(placeholder)), None, "{placeholder}");
+            assert_eq!(dns_server_text(v6(placeholder), 12), None, "{placeholder}");
         }
-        assert_eq!(dns_server_text(v4("0.0.0.0")), None);
+        assert_eq!(dns_server_text(v4("0.0.0.0"), 12), None);
     }
 
     #[test]
     fn dns_servers_put_the_default_route_adapter_first() {
         let mut lan = adapter(1, "Ethernet");
+        lan.ipv6_if_index = 12;
         lan.gateways = vec![v4("192.168.1.1")];
-        lan.dns_servers = vec![v4("192.168.1.1"), v6("fec0:0:0:ffff::1")];
+        lan.dns_servers = vec![v4("192.168.1.1"), v6("fe80::1"), v6("fec0:0:0:ffff::1")];
         let mut vpn = adapter(2, "WireGuard");
         vpn.dns_servers = vec![v4("10.8.0.1"), v4("192.168.1.1")];
         let mut host_only = adapter(3, "vEthernet (Default Switch)");
-        host_only.dns_servers = vec![v4("172.20.0.1")];
+        host_only.ipv6_if_index = 30;
+        host_only.dns_servers = vec![v4("172.20.0.1"), v6("fe80::1")];
         let mut down = adapter(4, "Wi-Fi");
         down.is_up = false;
         down.gateways = vec![v4("10.0.0.1")];
@@ -518,15 +588,28 @@ mod tests {
 
         // The VPN carries the default route: its resolver goes first, then
         // the LAN's (it has a gateway), then the host-only switch's. The
-        // duplicate, the placeholder and the down adapter are dropped.
+        // duplicate, the placeholder and the down adapter are dropped; fe80::1
+        // on two links is two servers.
         assert_eq!(
             dns_servers(&adapters, Some(2)),
-            ["10.8.0.1", "192.168.1.1", "172.20.0.1"]
+            [
+                "10.8.0.1",
+                "192.168.1.1",
+                "fe80::1%12",
+                "172.20.0.1",
+                "fe80::1%30"
+            ]
         );
         // No default route known: adapters with a gateway first.
         assert_eq!(
             dns_servers(&adapters, None),
-            ["192.168.1.1", "172.20.0.1", "10.8.0.1"]
+            [
+                "192.168.1.1",
+                "fe80::1%12",
+                "172.20.0.1",
+                "fe80::1%30",
+                "10.8.0.1"
+            ]
         );
         assert!(dns_servers(&[], None).is_empty());
     }
@@ -565,39 +648,103 @@ mod tests {
         assert_eq!(s.rx_packets, u64::MAX);
     }
 
+    fn if_row(luid: u64, alias: &str, flags: u8, in_octets: u64) -> IfRow {
+        IfRow {
+            luid,
+            alias: alias.into(),
+            flags,
+            counters: IfCounters {
+                in_octets,
+                ..IfCounters::default()
+            },
+        }
+    }
+
     #[test]
     fn stats_are_keyed_by_the_interface_list_names() {
         let mut lo = adapter(2, "Loopback Pseudo-Interface 1");
         lo.if_type = IF_TYPE_SOFTWARE_LOOPBACK;
-        let adapters = [adapter(1, "Ethernet"), lo, adapter(3, "Wi-Fi")];
-        let counters = HashMap::from([
-            (
-                1,
-                IfCounters {
-                    in_octets: 10,
-                    ..IfCounters::default()
-                },
+        let adapters = [
+            adapter(1, "Ethernet"),
+            lo,
+            adapter(3, "Wi-Fi"),
+            adapter(4, "vEthernet (WSL)"),
+        ];
+        let hw = IF_ROW_HARDWARE_INTERFACE;
+        let rows = [
+            if_row(1, "Ethernet", hw, 10),
+            if_row(2, "Loopback Pseudo-Interface 1", 0, 20),
+            // Not hardware, but listed: the list decides.
+            if_row(4, "vEthernet (WSL)", 0, 40),
+            // A filter module stacked on a NIC, and a WAN miniport.
+            if_row(
+                98,
+                "Ethernet-WFP Native MAC Layer LightWeight Filter-0000",
+                hw | IF_ROW_FILTER_INTERFACE,
+                30,
             ),
-            (
-                2,
-                IfCounters {
-                    in_octets: 20,
-                    ..IfCounters::default()
-                },
-            ),
-            // A filter interface the adapter list does not name.
-            (
-                99,
-                IfCounters {
-                    in_octets: 30,
-                    ..IfCounters::default()
-                },
-            ),
-        ]);
-        let stats = stats_by_name(&adapters, &counters);
+            if_row(99, "WAN Miniport (IP)", 0, 30),
+        ];
+        let stats = stats_by_name(&adapters, &rows);
         // Wi-Fi has no row and is left out rather than shown as zero.
-        assert_eq!(stats.len(), 1);
+        let mut names: Vec<_> = stats.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["Ethernet", "vEthernet (WSL)"]);
         assert_eq!(stats["Ethernet"].rx_bytes, 10);
+        assert_eq!(stats["vEthernet (WSL)"].rx_bytes, 40);
+    }
+
+    /// Get-NetAdapterStatistics reported a NIC whatever was bound to it, so a
+    /// capture-only NIC, or the physical one under a Hyper-V external switch,
+    /// keeps its counters though the adapter list (IP bound only) lacks it.
+    #[test]
+    fn a_nic_with_ip_unbound_keeps_its_counters() {
+        let adapters = [adapter(1, "vEthernet (External)")];
+        let rows = [
+            if_row(1, "vEthernet (External)", 0, 10),
+            if_row(2, "Ethernet", IF_ROW_HARDWARE_INTERFACE, 500),
+            // Its filter module carries the same traffic: not a second NIC.
+            if_row(
+                3,
+                "Ethernet-Hyper-V Virtual Switch Extension Filter-0000",
+                IF_ROW_HARDWARE_INTERFACE | IF_ROW_FILTER_INTERFACE,
+                500,
+            ),
+            // A hardware row with no alias has no name to show.
+            if_row(4, "", IF_ROW_HARDWARE_INTERFACE, 1),
+            // A NIC whose alias a listed adapter already has.
+            if_row(5, "vEthernet (External)", IF_ROW_HARDWARE_INTERFACE, 7),
+        ];
+        let stats = stats_by_name(&adapters, &rows);
+        assert_eq!(stats.len(), 2, "{stats:?}");
+        assert_eq!(stats["Ethernet"].name, "Ethernet");
+        assert_eq!(stats["Ethernet"].rx_bytes, 500);
+        assert_eq!(stats["vEthernet (External)"].rx_bytes, 10);
+    }
+
+    #[test]
+    fn if_row_flags_and_alias() {
+        let nic = if_row(1, "Ethernet", IF_ROW_HARDWARE_INTERFACE, 0);
+        assert!(nic.is_nic());
+        // ConnectorPresent and the other status bits do not matter.
+        assert!(if_row(1, "Ethernet", 0xfd, 0).is_nic());
+        assert!(!if_row(
+            1,
+            "x",
+            IF_ROW_HARDWARE_INTERFACE | IF_ROW_FILTER_INTERFACE,
+            0
+        )
+        .is_nic());
+        assert!(!if_row(1, "x", 0, 0).is_nic());
+
+        let mut alias = [0u16; 257];
+        for (i, u) in "Беспроводная сеть".encode_utf16().enumerate() {
+            alias[i] = u;
+        }
+        assert_eq!(wide_array_text(&alias), "Беспроводная сеть");
+        assert_eq!(wide_array_text(&[0; 4]), "");
+        // No terminator: the whole array.
+        assert_eq!(wide_array_text(&[u16::from(b'a'); 3]), "aaa");
     }
 
     #[test]

@@ -207,9 +207,9 @@ fn collect_dns() -> Vec<String> {
 /// and each further one sits alone on the next line. An IPv6 server contains
 /// colons itself, so the value is what follows the label's " : ", not the
 /// last colon, and continuation lines are recognised by parsing as an
-/// address rather than by lacking a colon. The zone index ("%12") is
-/// dropped, since the DNS probe parses the address without one, and
-/// Windows' fec0 placeholders go as on the API path.
+/// address rather than by lacking a colon. A link-local server keeps its
+/// zone index ("%12") and any other loses it, and Windows' fec0
+/// placeholders go, as on the API path (`ip_helper::dns_server_text`).
 #[cfg(any(target_os = "windows", test))]
 fn parse_ipconfig_dns(text: &str) -> Vec<String> {
     let mut servers = Vec::new();
@@ -229,10 +229,11 @@ fn parse_ipconfig_dns(text: &str) -> Vec<String> {
         if !in_dns {
             continue;
         }
-        let addr = value.split('%').next().unwrap_or_default().trim();
-        match addr.parse::<std::net::IpAddr>() {
+        let (addr, zone) = value.split_once('%').unwrap_or((value, ""));
+        match addr.trim().parse::<std::net::IpAddr>() {
             Ok(ip) => {
-                if let Some(text) = crate::platform::ip_helper::dns_server_text(ip) {
+                let zone = zone.trim().parse().unwrap_or(0);
+                if let Some(text) = crate::platform::ip_helper::dns_server_text(ip, zone) {
                     if !servers.contains(&text) {
                         servers.push(text);
                     }
@@ -346,6 +347,21 @@ Ethernet adapter vEthernet (WSL):
         }
         let c = cfg(&ipconfig.iter().map(String::as_str).collect::<Vec<_>>());
         assert_eq!(c.primary_dns().as_deref(), Some("2001:db8::53"));
+    }
+
+    /// A link-local resolver keeps the zone ipconfig prints, so Health
+    /// passes it over for the routable one and Diagnose leaves it out, as
+    /// on the API path.
+    #[test]
+    fn ipconfig_dns_keeps_a_link_local_servers_zone() {
+        let text = "\
+   DNS Servers . . . . . . . . . . . : fe80::1%12
+                                       192.168.1.1
+";
+        let servers = parse_ipconfig_dns(text);
+        assert_eq!(servers, ["fe80::1%12", "192.168.1.1"]);
+        let c = cfg(&servers.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(c.primary_dns().as_deref(), Some("192.168.1.1"));
     }
 
     #[test]
