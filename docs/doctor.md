@@ -19,12 +19,15 @@ linked build still requires its loader dependencies to start the executable.
 
 On Windows the `capture_library` entry's reason says which of these it found:
 
-| Reason | Meaning |
-| --- | --- |
-| `npcap_missing` | No `wpcap.dll` in `System32\Npcap` or `System32`. `next_check` gives the download link. |
-| `npcap_driver_stopped` | Npcap's files are there but its driver service is not running. |
-| `npcap_driver_missing` | A `wpcap.dll` with no `npcap` driver service, as WinPcap or a partial uninstall leaves. |
-| `npcap_present_unloaded` | Installed, and the driver is running or its state could not be read. Npcap is not loaded. `--check-capture` tests a real open. |
+| Reason | State | Meaning |
+| --- | --- | --- |
+| `npcap_missing` | `unavailable` | No `wpcap.dll` in `System32\Npcap` or `System32`. `next_check` gives the download link. |
+| `npcap_driver_stopped` | `unavailable` | Npcap's files are there but its driver service is not running. `next_check` gives `sc.exe start npcap`. |
+| `npcap_driver_missing` | `unavailable` | A `wpcap.dll` with no `npcap` driver service, as WinPcap or a partial uninstall leaves. |
+| `npcap_present_unloaded` | `not_checked` | Installed, and the driver is running or its state could not be read. Npcap is not loaded. `--check-capture` tests a real open. |
+
+Before 0.38, every Windows host with a `wpcap.dll` reported `not_checked`
+with `npcap_present_unloaded`, including the two `unavailable` cases above.
 
 Missing or malformed configuration is reported explicitly; malformed content and
 configured endpoint credentials are not echoed. Configuration defaults are used

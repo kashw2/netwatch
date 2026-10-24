@@ -570,11 +570,13 @@ fn npcap_capture_library(npcap: Npcap) -> (State, &'static str, String, String) 
                 .into(),
             check.into(),
         ),
+        // `sc.exe`, not `sc`: in Windows PowerShell `sc` is Set-Content, so
+        // `sc start npcap` writes a file named `start` and starts nothing.
         Npcap::Installed(Ok(_)) => (
             State::Unavailable,
             "npcap_driver_stopped",
             "Npcap is installed but its driver service (npcap) is not running".into(),
-            format!("As administrator, run sc start npcap or reinstall Npcap; then run {check}"),
+            format!("As administrator, run sc.exe start npcap or reinstall Npcap; then run {check}"),
         ),
         // WinPcap's DLL, or files a partial uninstall left behind. Either way
         // the driver Npcap registers is not there to start.
@@ -1020,6 +1022,8 @@ mod tests {
 
     /// SERVICE_STOPPED (1) and the pending states all mean capture would fail
     /// now, and the fix is starting the driver, not installing Npcap again.
+    /// The command has to work in cmd and in Windows PowerShell, where a bare
+    /// `sc` is the Set-Content alias.
     #[test]
     fn installed_npcap_with_stopped_driver_says_so() {
         for state_code in [1, 2, 3, 7] {
@@ -1028,7 +1032,8 @@ mod tests {
             assert_eq!(state, State::Unavailable);
             assert_eq!(reason, "npcap_driver_stopped");
             assert!(detail.contains("not running"), "{detail}");
-            assert!(next.contains("sc start npcap"), "{next}");
+            assert!(next.contains("sc.exe start npcap"), "{next}");
+            assert!(!next.contains("sc start"), "{next}");
         }
     }
 
