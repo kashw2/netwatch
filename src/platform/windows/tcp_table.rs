@@ -11,7 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::offset_of;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, INVALID_HANDLE_VALUE, NO_ERROR, TRUE,
+    CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ENOUGH_MEMORY, ERROR_NO_DATA,
+    INVALID_HANDLE_VALUE, NO_ERROR, TRUE,
 };
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
@@ -25,9 +26,10 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 
 /// Every TCP socket (listeners included) and every UDP socket on the host,
 /// IPv4 before IPv6, each table sorted by local endpoint as netstat listed
-/// them. `Err` carries the Win32 error from the first table that could not be
-/// read. The caller then falls back to netstat for all four rather than show
-/// a list with one family silently missing.
+/// them. A family the host has no table for (ERROR_NO_DATA) is empty, not a
+/// failure. `Err` carries the Win32 error from the first table that could not
+/// be read. The caller then falls back to netstat for all four rather than
+/// show a list with one family silently missing.
 pub fn sockets() -> Result<Vec<Socket>, u32> {
     let tcp4 = read_table::<MIB_TCPTABLE_OWNER_PID>(|buf, size| {
         // SAFETY: `read_table` passes a writable buffer of `*size` bytes,
@@ -138,16 +140,27 @@ owner_pid_table!(MIB_TCP6TABLE_OWNER_PID, MIB_TCP6ROW_OWNER_PID);
 owner_pid_table!(MIB_UDPTABLE_OWNER_PID, MIB_UDPROW_OWNER_PID);
 owner_pid_table!(MIB_UDP6TABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID);
 
+/// NTSTATUS STATUS_UNSUCCESSFUL. GetExtendedTcpTable and GetExtendedUdpTable
+/// return it, undocumented, in place of ERROR_INSUFFICIENT_BUFFER when the
+/// table changes while they copy it (psutil#1294, retried since psutil#1335).
+const STATUS_UNSUCCESSFUL: u32 = 0xC000_0001;
+
 /// Read one table through the sizing exchange these calls share: offer a
 /// buffer, and when it is too small the call writes the size it needs into
 /// `size` and returns ERROR_INSUFFICIENT_BUFFER. Sockets opened between two
 /// calls can outgrow the new size too, so the buffer is grown with some
-/// headroom and the call tried a few times.
+/// headroom and the call tried a few times. The same race can surface as
+/// STATUS_UNSUCCESSFUL, and the psutil report that found it also shows
+/// ERROR_NOT_ENOUGH_MEMORY. Neither promises to write a size, so the buffer
+/// grows from the larger of what was offered and what came back. Giving up
+/// on them would send the whole tick to netstat on exactly the busy hosts
+/// where spawning it costs the most.
 fn read_table<T: OwnerPidTable>(
     call: impl Fn(*mut c_void, &mut u32) -> u32,
 ) -> Result<Vec<T::Row>, u32> {
     // Room for a few hundred rows, which covers most hosts in one call.
     let mut size: u32 = 16 * 1024;
+    let mut last = NO_ERROR;
     for _ in 0..4 {
         // Never smaller than the table struct, so its count can be read.
         size = size.max(size_of::<T>() as u32);
@@ -155,13 +168,20 @@ fn read_table<T: OwnerPidTable>(
         // field in these tables needs.
         let mut buf = vec![0u32; (size as usize).div_ceil(4)];
         let mut filled = size;
-        match call(buf.as_mut_ptr().cast(), &mut filled) {
+        last = call(buf.as_mut_ptr().cast(), &mut filled);
+        match last {
             NO_ERROR => return Ok(rows::<T>(&buf, filled as usize)),
-            ERROR_INSUFFICIENT_BUFFER => size = filled.saturating_add(filled / 8),
+            // .NET reads this as "no interfaces of this family", an empty
+            // table rather than an error.
+            ERROR_NO_DATA => return Ok(Vec::new()),
+            ERROR_INSUFFICIENT_BUFFER | STATUS_UNSUCCESSFUL | ERROR_NOT_ENOUGH_MEMORY => {
+                let need = size.max(filled);
+                size = need.saturating_add(need / 8);
+            }
             other => return Err(other),
         }
     }
-    Err(ERROR_INSUFFICIENT_BUFFER)
+    Err(last)
 }
 
 /// Copy the rows out of a buffer a successful call filled. `filled` is the
@@ -233,7 +253,9 @@ impl From<&MIB_UDP6ROW_OWNER_PID> for Udp6Row {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::net::{TcpListener, TcpStream, UdpSocket};
+    use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         MIB_TCP_STATE_CLOSED, MIB_TCP_STATE_CLOSE_WAIT, MIB_TCP_STATE_CLOSING,
         MIB_TCP_STATE_DELETE_TCB, MIB_TCP_STATE_ESTAB, MIB_TCP_STATE_FIN_WAIT1,
@@ -243,6 +265,89 @@ mod tests {
 
     fn own_pid() -> Option<u32> {
         Some(std::process::id())
+    }
+
+    /// Runs `read_table` against a stand-in for GetExtendedTcpTable that
+    /// answers with each `(code, size it writes back)` of `script` in turn,
+    /// then succeeds with one row. Returns the rows and every size offered.
+    fn scripted(script: &[(u32, Option<u32>)]) -> (Result<Vec<Tcp4Row>, u32>, Vec<u32>) {
+        let offered = RefCell::new(Vec::new());
+        let result = read_table::<MIB_TCPTABLE_OWNER_PID>(|buf, size| {
+            let mut offered = offered.borrow_mut();
+            offered.push(*size);
+            if let Some(&(code, reported)) = script.get(offered.len() - 1) {
+                if let Some(reported) = reported {
+                    *size = reported;
+                }
+                return code;
+            }
+            // SAFETY: `read_table` offers at least a whole table, zeroed and
+            // aligned for it, and this is the only reference to it.
+            let table = unsafe { &mut *buf.cast::<MIB_TCPTABLE_OWNER_PID>() };
+            table.dwNumEntries = 1;
+            table.table[0] = MIB_TCPROW_OWNER_PID {
+                dwState: MIB_TCP_STATE_ESTAB as u32,
+                dwOwningPid: 42,
+                ..Default::default()
+            };
+            NO_ERROR
+        });
+        let rows = result.map(|rows| rows.iter().map(Tcp4Row::from).collect());
+        (rows, offered.into_inner())
+    }
+
+    fn the_row() -> Vec<Tcp4Row> {
+        vec![Tcp4Row {
+            state: MIB_TCP_STATE_ESTAB as u32,
+            owning_pid: 42,
+            ..Default::default()
+        }]
+    }
+
+    /// A table that changes while it is copied can come back as the
+    /// undocumented STATUS_UNSUCCESSFUL, or as ERROR_NOT_ENOUGH_MEMORY, with
+    /// no size written or a zero one. Both are retried with a larger buffer,
+    /// not handed up to send the whole tick to netstat.
+    #[test]
+    fn a_table_changing_mid_copy_is_read_again() {
+        let (rows, offered) = scripted(&[
+            (STATUS_UNSUCCESSFUL, None),
+            (ERROR_NOT_ENOUGH_MEMORY, Some(0)),
+        ]);
+        assert_eq!(rows, Ok(the_row()));
+        assert_eq!(offered.len(), 3);
+        assert!(
+            offered.windows(2).all(|w| w[1] > w[0]),
+            "each retry offers more room: {offered:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_buffer_grows_past_the_size_the_call_asks_for() {
+        let (rows, offered) = scripted(&[(ERROR_INSUFFICIENT_BUFFER, Some(100_000))]);
+        assert_eq!(rows, Ok(the_row()));
+        assert!(offered[1] >= 100_000, "offered {offered:?}");
+    }
+
+    /// .NET reads ERROR_NO_DATA as a family with no interfaces. Counting it
+    /// as a failure would send all four tables to netstat on such a host on
+    /// every tick.
+    #[test]
+    fn no_table_for_a_family_is_empty_not_a_failure() {
+        let (rows, offered) = scripted(&[(ERROR_NO_DATA, None)]);
+        assert_eq!(rows, Ok(Vec::new()));
+        assert_eq!(offered.len(), 1);
+    }
+
+    #[test]
+    fn a_hard_failure_or_a_race_that_never_settles_is_reported() {
+        let (rows, offered) = scripted(&[(ERROR_INVALID_PARAMETER, None)]);
+        assert_eq!(rows, Err(ERROR_INVALID_PARAMETER));
+        assert_eq!(offered.len(), 1, "not retried");
+
+        let (rows, offered) = scripted(&[(STATUS_UNSUCCESSFUL, None); 4]);
+        assert_eq!(rows, Err(STATUS_UNSUCCESSFUL));
+        assert_eq!(offered.len(), 4);
     }
 
     /// `tcp_state_name` matches on bare numbers so it can be tested off

@@ -6,7 +6,8 @@ the isolated check's results. Live Settings and startup use the same capability
 model with runtime observations; static configuration is never a health verdict.
 
 This matrix describes the implementation as of 18 October 2026 (0.35.4); the
-FreeBSD column dates from 0.35. It is not a claim
+FreeBSD column dates from 0.35, and the Windows process-attribution cell from
+0.38 (earlier versions polled `netstat -ano` and `tasklist`). It is not a claim
 that every backend was exercised on every supported OS. Linux unit tests do not
 establish macOS or Windows runtime parity.
 

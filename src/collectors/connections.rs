@@ -1683,9 +1683,9 @@ fn windows_connections(
 /// `netstat -ano`, for when the socket tables cannot be read through the API.
 /// Brought into line with what the API path reports wherever netstat's text
 /// allows: English state names become netwatch's, a listener's `0.0.0.0:0`
-/// or `[::]:0` peer becomes `*:*`, and PID 0 is no owner. A state in another
-/// display language is kept as netstat printed it; only the API path can
-/// name it.
+/// or `[::]:0` peer becomes `*:*`, a link-local address loses its `%12`
+/// scope, and PID 0 is no owner. A state in another display language is kept
+/// as netstat printed it; only the API path can name it.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn parse_netstat_output(text: &str) -> Vec<crate::platform::socket_table::Socket> {
     use crate::platform::socket_table::{netstat_state_name, owner, Socket};
@@ -1707,18 +1707,31 @@ fn parse_netstat_output(text: &str) -> Vec<crate::platform::socket_table::Socket
             _ => continue,
         };
         let remote = match cols[2] {
-            "0.0.0.0:0" | "[::]:0" => "*:*",
-            other => other,
+            "0.0.0.0:0" | "[::]:0" => "*:*".to_string(),
+            other => without_scope(other),
         };
         sockets.push(Socket {
             protocol,
-            local_addr: cols[1].to_string(),
-            remote_addr: remote.to_string(),
+            local_addr: without_scope(cols[1]),
+            remote_addr: remote,
             state,
             pid: pid.parse().ok().and_then(owner),
         });
     }
     sockets
+}
+
+/// A netstat endpoint without the scope it prints on a link-local IPv6
+/// address (`[fe80::1%12]:1900`). The API rows carry none, so a socket read
+/// through either path has the same endpoint, and the same flow key.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn without_scope(endpoint: &str) -> String {
+    match (endpoint.find('%'), endpoint.find(']')) {
+        (Some(scope), Some(close)) if scope < close => {
+            format!("{}{}", &endpoint[..scope], &endpoint[close..])
+        }
+        _ => endpoint.to_string(),
+    }
 }
 
 /// PID -> image name from `tasklist`, for when a process snapshot fails.
@@ -2895,6 +2908,26 @@ Aktive Verbindungen
         assert_eq!(rows[0].remote_addr, "*:*");
         assert_eq!(rows[1].state, "HERGESTELLT");
         assert_eq!(rows[1].pid, Some(8812));
+    }
+
+    /// The API rows carry no IPv6 scope; the fallback drops netstat's, so
+    /// the same socket keeps one endpoint whichever path read it.
+    #[test]
+    fn netstat_link_local_endpoints_lose_their_scope() {
+        let rows = parse_netstat_output(
+            "  TCP    [fe80::a5d1:f1c0:5bd4:3f7b%12]:50700  [fe80::1%12]:445  ESTABLISHED  8812
+  UDP    [fe80::a5d1:f1c0:5bd4:3f7b%12]:1900  *:*  2260
+",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].local_addr, "[fe80::a5d1:f1c0:5bd4:3f7b]:50700");
+        assert_eq!(rows[0].remote_addr, "[fe80::1]:445");
+        assert_eq!(rows[1].local_addr, "[fe80::a5d1:f1c0:5bd4:3f7b]:1900");
+        assert_eq!(rows[1].remote_addr, "*:*");
+        assert_eq!(
+            normalize_addr(&rows[0].local_addr),
+            Some(("fe80::a5d1:f1c0:5bd4:3f7b".parse().unwrap(), 50700))
+        );
     }
 
     #[test]

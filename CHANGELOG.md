@@ -32,10 +32,12 @@ All notable changes to NetWatch will be documented in this file.
   `GetExtendedTcpTable` and `GetExtendedUdpTable`, and process names from
   one process snapshot, where every refresh used to start two commands. The
   names are the `chrome.exe` names tasklist gave. A listener's peer reads
-  `*:*` instead of `0.0.0.0:0`. A TIME_WAIT connection reads "unattributed"
-  instead of "System Idle Process", since no process owns it any more. The
-  connection detail's Match line says `IpHelper`. netstat and tasklist are
-  used only if those calls fail.
+  `*:*` instead of `0.0.0.0:0`. An IPv6 link-local address no longer carries
+  its `%12` scope suffix, in the views and in the JSON and CSV exports. A
+  TIME_WAIT connection reads "unattributed" instead of "System Idle
+  Process", since no process owns it any more. The connection detail's
+  Match line says `IpHelper`. netstat and tasklist are used only if those
+  calls fail.
 
 ### Fixed
 - **Lite view: keys no longer overflow in a terminal smaller than its
@@ -53,6 +55,12 @@ All notable changes to NetWatch will be documented in this file.
 - **Processes view: SOCKET STATES counts CLOSE-WAIT, FIN-WAIT and SYN
   sockets on Linux.** It knew only lsof's spelling (`CLOSE_WAIT`), so it
   counted Linux's `CLOSE-WAIT` as other.
+- **Linux: the Dense view dims closing sockets, and the Connections view
+  flags CLOSE-WAIT.** Both knew only lsof's spellings (`TIME_WAIT`,
+  `CLOSE_WAIT`), not the `TIME-WAIT` and `CLOSE-WAIT` that Linux, and now
+  Windows, report. A closing row in the Dense view drew as live, with its
+  state cut to `TIME-WA…`, and a `CLOSE-WAIT` or `FIN-WAIT` row in the
+  Connections view was muted instead of drawn in the error colour.
 
 ### Dependencies
 - **windows-sys 0.61 is a direct dependency on Windows**, for the IP Helper
