@@ -257,7 +257,9 @@ All notable changes to NetWatch will be documented in this file.
   every system it declares, and checks that the built binary reports the
   Cargo.toml version. The flake had stopped building without anyone
   noticing until #105, from @kashw2, fixed it and made it read its version
-  from Cargo.toml.
+  from Cargo.toml. The flake now lists x86_64-linux, aarch64-linux and
+  aarch64-darwin only: nixpkgs dropped Intel Macs in 26.11, and listing
+  them made the flake fail to evaluate.
 - **Windows CI runs the binary it builds.** On a runner with no Npcap,
   `netwatch --version` must print the Cargo.toml version, and
   `netwatch doctor --json` must report `npcap_missing` with the download
