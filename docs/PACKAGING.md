@@ -101,8 +101,10 @@ Each flag earns its place:
 
 The image is not `scratch`. netwatch shells out to `ss` and `ip` (iproute2)
 for the connection table and routes, `ping` (iputils) for gateway and internet
-RTT, and `iw` for wireless signal; without `ss` in particular the Connections,
-Processes and Egress tabs are simply empty. Traceroute is native on Linux and
+RTT, and `iw` for wireless signal. Without `ss` the connection table is read
+from `/proc/net` instead, losing only the interface suffix `ss` prints for a
+socket bound to a device; `netwatch doctor` reports it as
+`connections: degraded [proc_net_fallback]`. Traceroute is native on Linux and
 needs no binary. `chronyc` is left out, so Diagnose reports NTP clock offset as
 unmeasured rather than guessing.
 
