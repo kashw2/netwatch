@@ -22,6 +22,13 @@ All notable changes to NetWatch will be documented in this file.
 - **`confirm_quit`** (Settings → Confirm Quit, off by default): `q` asks
   "Quit netwatch?" first, and `y`, `q` or `Enter` confirms. `Ctrl+C` still
   quits at once (#94).
+- **`netwatch doctor` says where the Linux connection table will come
+  from.** A new `connections` entry reads `ready` (`ss_found`, with the path)
+  when `ss` is on `PATH`, and `degraded` (`proc_net_fallback`) when it is
+  not, naming the `/proc/net` tables a live session reads instead. When
+  `/proc/net/tcp` cannot be read either, it reads `unavailable`
+  (`no_connection_table`), because the table will be empty. The JSON gains
+  that one capability and nothing else changes.
 
 ### Changed
 - **`q` closes the help, settings and memory overlays** instead of quitting
@@ -46,6 +53,17 @@ All notable changes to NetWatch will be documented in this file.
   were `not_checked [npcap_present_unloaded]`. Before, doctor said "DLL and
   driver not loaded" either way, and told a user who had Npcap to install
   it.
+- **Linux: the connection table is no longer empty without `ss`.** When
+  `ss` is missing (minimal containers, some NAS distributions), cannot
+  start, or fails, netwatch reads the kernel's
+  `/proc/net/{tcp,tcp6,udp,udp6}` tables instead, so Connections, Processes
+  and Egress fill as they do with `ss`, and processes are attributed the
+  same way. The rows read the same with two exceptions: a socket bound to
+  a device loses the `%lo`-style suffix `ss` adds, and a dual-stack
+  wildcard reads `[::]:port` where `ss` prints `*:port`. While the fallback
+  is in use, Settings shows a `connections: degraded` row with the reason.
+  The log notes each switch once rather than every poll, and warns when a
+  poll can read no table at all, from the first poll on.
 
 ### CI
 - **Windows CI runs the binary it builds.** On a runner with no Npcap,
