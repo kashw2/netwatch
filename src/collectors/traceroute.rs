@@ -24,10 +24,10 @@ pub struct TracerouteResult {
     pub status: TracerouteStatus,
     pub hops: Vec<TracerouteHop>,
     /// Whether the destination itself answered — a port-unreachable from the
-    /// target on the Linux native path, an echo reply on the Windows one, or a
-    /// final hop matching the target address on the subprocess path. `None`
-    /// when the trace cannot tell, which is the usual case for a firewalled
-    /// tail.
+    /// target on the Linux native path, an echo reply or the target's own
+    /// unreachable on the Windows one, or a final hop matching the target
+    /// address on the subprocess path. `None` when the trace cannot tell,
+    /// which is the usual case for a firewalled tail.
     ///
     /// Diagnose needs this to decide whether silence after a lossy hop means
     /// "the loss propagates" or "we simply cannot see past it".
@@ -184,7 +184,7 @@ fn run_traceroute_icmp(
             }
             echoes.push(icmp.echo(ttl, PROBE_TIMEOUT_MS));
         }
-        match icmp_hop(ttl, &echoes) {
+        match icmp_hop(dst, ttl, &echoes) {
             IcmpHop::Unsendable(code) if hops.is_empty() => {
                 return Some(Err(format!(
                     "could not send an echo request to {target} (status {code})"
@@ -211,24 +211,37 @@ fn run_traceroute_icmp(
 #[derive(Debug)]
 enum IcmpHop {
     /// A hop to record. `Some(reached)` ends the trace there: `true` when the
-    /// destination answered, `false` when something on the path said it
-    /// cannot be reached, after which every higher TTL hears the same.
+    /// destination answered, with an echo reply or an error of its own;
+    /// `false` when a router on the path said it cannot be reached, after
+    /// which every higher TTL hears the same.
     Hop(TracerouteHop, Option<bool>),
     /// Not one probe at this TTL left the host; carries the status.
     Unsendable(u32),
 }
 
-/// Decode one TTL's echoes into the hop the UI and Diagnose read: the first
-/// address that answered, and one RTT or `None` per probe.
+/// Decode one TTL's echoes to `dst` into the hop the UI and Diagnose read:
+/// the first address that answered, and one RTT or `None` per probe.
+///
+/// An unreachable sent by `dst` itself still means the destination answered:
+/// a host that rejects echo requests (iptables' default REJECT is a
+/// port-unreachable, firewalld's icmp-block an admin-prohibited) is up, as a
+/// port-unreachable from the target is on the Linux native path.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn icmp_hop(ttl: u8, echoes: &[crate::platform::icmp::Echo]) -> IcmpHop {
+fn icmp_hop(dst: std::net::IpAddr, ttl: u8, echoes: &[crate::platform::icmp::Echo]) -> IcmpHop {
     use crate::platform::icmp::Echo;
     if let Some(Echo::Failed(code)) = echoes.first() {
         if echoes.iter().all(|e| !e.was_sent()) {
             return IcmpHop::Unsendable(*code);
         }
     }
-    let end = if echoes.iter().any(|e| matches!(e, Echo::Reply { .. })) {
+    let from_dst = |from: Option<std::net::IpAddr>| {
+        from.is_some_and(|ip| ip.to_canonical() == dst.to_canonical())
+    };
+    let end = if echoes.iter().any(|e| match *e {
+        Echo::Reply { .. } => true,
+        Echo::Unreachable { from, .. } => from_dst(from),
+        _ => false,
+    }) {
         Some(true)
     } else if echoes.iter().any(|e| matches!(e, Echo::Unreachable { .. })) {
         Some(false)
@@ -511,9 +524,10 @@ fn parse_traceroute_output(output: &str) -> Vec<TracerouteHop> {
 
     for line in output.lines() {
         let mut tokens = line.split_whitespace();
-        // Header, footer and error lines ("traceroute to ...", "Tracing route
-        // to ...", "Trace complete.", "Transmit error: code 1231.") do not
-        // start with a hop number.
+        // Header and footer lines ("traceroute to ...", "Tracing route to
+        // ...", "Trace complete.") do not start with a hop number. tracert's
+        // send failures do ("  1  Transmit error: code 1231."), and leave no
+        // hop because parse_rtt does not take the code for an RTT.
         let Some(hop_number) = tokens.next().and_then(|t| t.parse::<u8>().ok()) else {
             continue;
         };
@@ -570,13 +584,16 @@ fn parse_traceroute_output(output: &str) -> Vec<TracerouteHop> {
 /// tracert's `<N` means under N ms. It stands as half of N, so a
 /// sub-millisecond hop reads as sub-millisecond, as it does on the native
 /// paths, rather than as 0 or as a full millisecond.
+///
+/// A number that ends a sentence is not a probe column: tracert's "Transmit
+/// error: code 1231." would otherwise read as a 1231 ms answer.
 fn parse_rtt(tok: &str) -> Option<f64> {
     let (under, num) = match tok.strip_prefix('<') {
         Some(rest) => (true, rest),
         None => (false, tok),
     };
     let num = num.trim_end_matches(char::is_alphabetic);
-    if !num.starts_with(|c: char| c.is_ascii_digit()) {
+    if !num.starts_with(|c: char| c.is_ascii_digit()) || num.ends_with('.') {
         return None;
     }
     let ms: f64 = num.parse().ok()?;
@@ -729,6 +746,18 @@ Ablaufverfolgung beendet.
     }
 
     #[test]
+    fn a_send_failure_is_not_a_hop() {
+        // tracert numbers the hop it could not send, then prints the error.
+        for line in [
+            "  1  Transmit error: code 1231.",
+            "  1  Übertragungsfehler: Code 1231.",
+            "  1     General failure.",
+        ] {
+            assert!(parse_traceroute_output(line).is_empty(), "{line}");
+        }
+    }
+
+    #[test]
     fn a_reporting_hop_keeps_its_address_and_ignores_the_report() {
         let hops = parse_traceroute_output(
             "  1    <1 ms    <1 ms    <1 ms  192.168.1.1
@@ -789,6 +818,7 @@ Ablaufverfolgung beendet.
             "мс",
             "*",
             "out.",
+            "1231.",
             "inf",
             "NaN",
             "!H",
@@ -836,7 +866,7 @@ Ablaufverfolgung beendet.
         }
 
         fn hop(echoes: &[Echo]) -> (TracerouteHop, Option<bool>) {
-            match icmp_hop(4, echoes) {
+            match icmp_hop(ip(TARGET), 4, echoes) {
                 IcmpHop::Hop(hop, end) => (hop, end),
                 other => panic!("expected a hop, got {other:?}"),
             }
@@ -888,10 +918,31 @@ Ablaufverfolgung beendet.
             assert_eq!(end, Some(false));
         }
 
+        /// A target that rejects echo requests (iptables REJECT, a firewalld
+        /// icmp-block) answers them with an unreachable of its own: it was
+        /// reached, as a port-unreachable from the target is on Linux.
+        #[test]
+        fn an_unreachable_from_the_destination_reaches_it() {
+            let rejected = Echo::Unreachable {
+                from: Some(ip(TARGET)),
+                rtt_ms: 14.0,
+            };
+            let (h, end) = hop(&[Echo::TimedOut, rejected, rejected]);
+            assert_eq!(h.ip.as_deref(), Some(TARGET));
+            assert_eq!(h.rtt_ms, vec![None, Some(14.0), Some(14.0)]);
+            assert_eq!(end, Some(true));
+            // The same target written as a v4-mapped IPv6 address.
+            let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+            assert!(matches!(
+                icmp_hop(mapped, 4, &[rejected; 3]),
+                IcmpHop::Hop(_, Some(true))
+            ));
+        }
+
         #[test]
         fn a_hop_the_stack_would_not_send_is_not_silence() {
             assert!(matches!(
-                icmp_hop(1, &[Echo::Failed(11050); 3]),
+                icmp_hop(ip(TARGET), 1, &[Echo::Failed(11050); 3]),
                 IcmpHop::Unsendable(11050)
             ));
             // One probe out of three left: that is a hop, with stars.

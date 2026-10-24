@@ -241,11 +241,8 @@ impl Runner {
         (s.obs.clone(), s.times.clone(), s.progress.clone())
     }
     pub fn start(&self, rule: &str, cfg: &Config) -> Result<(), String> {
-        if rule == "ipv6.broken" && !cfg!(target_os = "linux") {
-            return Err(IPV6_UNSUPPORTED.into());
-        }
-        if rule == "pmtu.blackhole" && !PMTU_SUPPORTED {
-            return Err(PMTU_UNSUPPORTED.into());
+        if let Some(why) = unsupported(rule) {
+            return Err(why.into());
         }
         cfg.validate(rule)?;
         let mut s = self.state.lock().unwrap();
@@ -326,6 +323,17 @@ pub const PMTU_SUPPORTED: bool = cfg!(unix);
 /// Why `pmtu.blackhole` cannot run on Windows.
 pub const PMTU_UNSUPPORTED: &str =
     "the PMTU check confirms a black hole with a reduced TCP MSS, which Windows cannot set per socket";
+
+/// Why `rule` cannot run on this platform, whatever the configuration says.
+/// Checked before the configuration, so no setting is asked for that would
+/// not make it runnable.
+pub fn unsupported(rule: &str) -> Option<&'static str> {
+    match rule {
+        "ipv6.broken" if !cfg!(target_os = "linux") => Some(IPV6_UNSUPPORTED),
+        "pmtu.blackhole" if !PMTU_SUPPORTED => Some(PMTU_UNSUPPORTED),
+        _ => None,
+    }
+}
 
 /// Whether this host has an IPv6 default route and a global address, so the
 /// experiment means something. Off Linux, Unsupported.
@@ -723,6 +731,15 @@ mod tests {
         );
         assert_ne!(PMTU_UNSUPPORTED, IPV6_UNSUPPORTED);
     }
+    #[test]
+    fn only_the_platform_makes_an_experiment_unsupported() {
+        assert_eq!(unsupported("pmtu.blackhole").is_some(), !PMTU_SUPPORTED);
+        assert_eq!(
+            unsupported("ipv6.broken").is_some(),
+            !cfg!(target_os = "linux")
+        );
+        assert_eq!(unsupported("captive.portal"), None);
+    }
     #[cfg(windows)]
     #[test]
     fn pmtu_experiment_refuses_to_start_on_windows() {
@@ -733,6 +750,11 @@ mod tests {
         let runner = Runner::default();
         assert_eq!(
             runner.start("pmtu.blackhole", &cfg),
+            Err(PMTU_UNSUPPORTED.to_string())
+        );
+        // Unconfigured, it still says why, not "set pmtu_url".
+        assert_eq!(
+            runner.start("pmtu.blackhole", &Config::default()),
             Err(PMTU_UNSUPPORTED.to_string())
         );
         // Not even a DNS lookup or a ping: the answer is the platform's.

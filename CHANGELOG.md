@@ -46,17 +46,22 @@ All notable changes to NetWatch will be documented in this file.
   start off Unix, so `T` ended in an error on Windows. Windows now traces
   natively through the ICMP API, IPv4 and IPv6, with three probes a hop up
   to 30 hops, and records whether the destination itself answered, which
-  Diagnose's path rules read. `tracert` remains the fallback for a target
-  that is not an address, and netwatch now reads its output correctly.
-  `<1 ms` is under a millisecond rather than a hop named "<1", `*` is a
-  probe with no answer, and a hop's address comes only from a token that
-  parses as one, so "Request timed out." no longer leaves "out." as the
-  address. The tests cover English, German and Russian output.
+  Diagnose's path rules read. A target that rejects pings with an
+  unreachable of its own (an iptables REJECT, a firewalld icmp-block) counts
+  as answered, as it does on Linux. `tracert` remains the fallback for a
+  target that is not an address, and netwatch now reads its output
+  correctly. `<1 ms` is under a millisecond rather than a hop named "<1",
+  `*` is a probe with no answer, a hop's address comes only from a token
+  that parses as one, so "Request timed out." no longer leaves "out." as
+  the address, and "Transmit error: code 1231." is no hop rather than a
+  1231 ms one. The tests cover English, German and Russian output.
 - **Diagnose: the PMTU experiment is "unsupported" on Windows.** It
   confirms a black hole by repeating a transfer at a reduced TCP MSS, and
   Windows cannot set the MSS of one socket, so the experiment could never
-  find a black hole there. The coverage row now says why and `t` refuses
-  it, as the IPv6 experiment does off Linux.
+  find a black hole there. The coverage row now says why and no longer
+  suggests `t`, and both `t` and `diagnose coverage --test pmtu.blackhole`
+  refuse it, before asking for a `pmtu_url`, as the IPv6 experiment does
+  off Linux.
 
 ### Dependencies
 - **windows-sys 0.61 (Windows only)**, for the ICMP API calls. Their

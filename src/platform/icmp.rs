@@ -51,6 +51,10 @@ pub enum Echo {
     Reply { from: IpAddr, rtt_ms: f64 },
     /// The TTL (hop limit) ran out on the way, and the router where it did
     /// said so. One traceroute hop.
+    ///
+    /// `from` here and in `Unreachable` is `None` when the API reported the
+    /// status with no reply to read; `rtt_ms` then holds only the call's
+    /// own time, and `Echo::rtt_ms` gives no round trip.
     TimeExceeded { from: Option<IpAddr>, rtt_ms: f64 },
     /// The destination, or a router before it, said the packet cannot be
     /// delivered: unreachable, prohibited, or too big to forward.
@@ -80,12 +84,25 @@ impl Echo {
     }
 
     /// The round trip of an answer of any kind; `None` for no answer.
+    ///
+    /// An unreachable or time-exceeded the API reports with no reply
+    /// (`from: None`) came back from nobody, so it has no round trip: the
+    /// call's time is the stack's own wait, not a packet's.
     pub fn rtt_ms(&self) -> Option<f64> {
         match *self {
             Self::Reply { rtt_ms, .. }
-            | Self::TimeExceeded { rtt_ms, .. }
-            | Self::Unreachable { rtt_ms, .. } => Some(rtt_ms),
-            Self::TimedOut | Self::Failed(_) => None,
+            | Self::TimeExceeded {
+                from: Some(_),
+                rtt_ms,
+            }
+            | Self::Unreachable {
+                from: Some(_),
+                rtt_ms,
+            } => Some(rtt_ms),
+            Self::TimeExceeded { from: None, .. }
+            | Self::Unreachable { from: None, .. }
+            | Self::TimedOut
+            | Self::Failed(_) => None,
         }
     }
 }
@@ -224,6 +241,18 @@ mod tests {
             let e = decode(status, Some(ROUTER), 9, ms(9));
             assert!(matches!(e, Echo::Unreachable { .. }), "{status}");
             assert_eq!(e.rtt_ms(), Some(9.0));
+        }
+    }
+
+    #[test]
+    fn a_status_with_no_reply_has_no_round_trip() {
+        // The call returned no reply after 3 s and GetLastError gave the
+        // status: ping.exe's bare "Destination host unreachable.".
+        for status in [IP_DEST_HOST_UNREACHABLE, IP_TTL_EXPIRED_TRANSIT] {
+            let e = decode(status, None, 0, ms(3000));
+            assert!(e.was_sent(), "{status}");
+            assert_eq!(e.answered_by(), None, "{status}");
+            assert_eq!(e.rtt_ms(), None, "{status}");
         }
     }
 
